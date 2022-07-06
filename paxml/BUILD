@@ -205,6 +205,7 @@ pytype_binary(
     deps = [
         # Please add additional dependencies to the target "main_lib" below.
         # so that they are also included in the BUILD macro pax_targets().
+        ":linker_opts",
         ":main_lib",
     ],
 )
@@ -218,7 +219,6 @@ pytype_strict_library(
         ":base_experiment",
         ":eval_lib",
         ":experiment_registry",
-        ":linker_opts",
         ":setup_jax",
         ":train",
         ":trainer_lib",
