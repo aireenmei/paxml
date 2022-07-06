@@ -19,8 +19,8 @@ from typing import List
 
 import jax
 from paxml import base_experiment
-from paxml import base_task
 from paxml import experiment_registry
+from paxml import tasks_lib
 from paxml.tasks.lm import input_generator
 from paxml.tasks.lm import model_params
 from praxis import base_input
@@ -65,7 +65,7 @@ class BertDataset(base_experiment.BaseExperiment):
     """Returns a list of dataset parameters."""
     return [self._datasetTrain(), self._datasetTest()]
 
-  def task(self) -> base_task.BaseTask.HParams:
+  def task(self) -> tasks_lib.SingleTask.HParams:
     raise NotImplementedError()
 
 
@@ -85,7 +85,8 @@ class BertAdamL4H128(model_params.TransformerBertPmapAdam, BertDataset):
   WEIGHT_DECAY = 1e-3
   USE_REPEATED_LAYER = False
   CHECKPOINT_POLICY = layers.AutodiffCheckpointType.SAVE_DOT_WITH_NO_BATCH_DIM
-  ACTIVATION_FUNCTION = 'RELU'
+  ACTIVATION_CLS = layers.ReLU
+  USE_GATED_ACTIVATION = False
   # Save a checkpoint every n steps.
   CHECKPOINT_EVERY_N_STEPS = 5000
 
@@ -108,7 +109,8 @@ class BertSpmd(model_params.TransformerBertSpmdAdafactor, BertDataset):
   ENABLE_BFLOAT16 = False
   MASK_TOKEN_ID = 0
 
-  ACTIVATION_FUNCTION = 'RELU'
+  ACTIVATION_CLS = layers.ReLU
+  USE_GATED_ACTIVATION = False
 
   # Sub-class has to specify a mesh.
   MESH_SHAPE = None
@@ -170,11 +172,11 @@ class BertSpmdL33H12kBiggerBatch(BertSpmd):
   # Save a checkpoint every n steps.
   CHECKPOINT_EVERY_N_STEPS = 1000
 
-  def task(self) -> base_task.BaseTask.HParams:
+  def task(self) -> tasks_lib.SingleTask.HParams:
     """Returns the task parameters."""
     task_p = super().task()
     # Enable label smoothing.
-    task_p.model.label_smoothing_prob = 0.1  # pytype: disable=attribute-error  # enable-nested-classes
+    task_p.model.label_smoothing_prob = 0.1
     return task_p
 
 

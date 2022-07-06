@@ -124,7 +124,7 @@ class CheckpointLoadingRules(NamedTuple):
     load_opt_states: whether to load opt_states (in its entirety) from this
       checkpoint.
   """
-  task_p: base_task.BaseTask.HParams
+  task_p: SingleTask.HParams
   load_rules: Sequence[Tuple[RegexStr, str]]
   ignore_rules: Optional[Sequence[RegexStr]] = None
   step: Optional[int] = None
@@ -219,11 +219,11 @@ class SingleTask(base_task.BaseTask):
     # context here, so we need to wrap it in a lambda which will look it up from
     # the global scope later.
     train: SingleTask.TrainHParams = sub_config_field(
-        lazy_ref=lambda: SingleTask.TrainHParams)  # pytype: disable=name-error
+        lazy_ref=lambda: SingleTask.TrainHParams)
     metrics: Any = None
     loss_aggregator: Any = None
     vn: SingleTask.VariationalNoiseHParams = sub_config_field(
-        lazy_ref=lambda: SingleTask.VariationalNoiseHParams)  # pytype: disable=name-error
+        lazy_ref=lambda: SingleTask.VariationalNoiseHParams)
     track_decoder_metric: Optional[str] = None
 
   def __init__(self, hparams: SingleTask.HParams) -> None:

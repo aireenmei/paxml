@@ -20,7 +20,6 @@ from typing import Optional, Sequence
 
 from jax import numpy as jnp
 from paxml import base_experiment
-from paxml import base_task
 from paxml import tasks_lib
 from praxis import asserts
 from praxis import base_layer
@@ -29,6 +28,7 @@ from praxis import layers
 from praxis import optimizers
 from praxis import py_utils
 from praxis import schedules
+from praxis.layers import activations
 from praxis.layers import embedding_softmax
 from praxis.layers import models
 
@@ -37,7 +37,7 @@ WeightInit = base_layer.WeightInit
 
 
 def set_sharding_annotations_v1(
-    task_p: base_task.BaseTask.HParams,
+    task_p: tasks_lib.SingleTask.HParams,
     training_optimized: bool,
     ici_mesh_shape: Sequence[int],
     dcn_mesh_shape: Optional[Sequence[int]] = None,
@@ -51,7 +51,7 @@ def set_sharding_annotations_v1(
     ici_mesh_shape: a 3D sequence representing the mesh shape for a slice.
     dcn_mesh_shape: a 3D sequence representing the mesh across slices, or None.
   """
-  model_p = task_p.model  # pytype: disable=attribute-error  # enable-nested-classes
+  model_p = task_p.model
   asserts.eq(len(ici_mesh_shape), 3)
   model_p.ici_mesh_shape = ici_mesh_shape
   if dcn_mesh_shape is not None:
@@ -61,7 +61,7 @@ def set_sharding_annotations_v1(
   data_axis = 'data'
   mdl_axis = 'mdl'
   mesh_axis_names = [replica_axis, data_axis, mdl_axis]
-  task_p.train.inputs_split_mapping = NestedMap(  # pytype: disable=attribute-error  # enable-nested-classes
+  task_p.train.inputs_split_mapping = NestedMap(
       map_1d=((replica_axis, data_axis),),
       map_2d=((replica_axis, data_axis), None))
   model_p.mesh_axis_names = mesh_axis_names
@@ -77,7 +77,7 @@ def set_sharding_annotations_v1(
         training_optimized=training_optimized)
 
 
-def set_default_adam(task_p: base_task.BaseTask.HParams,
+def set_default_adam(task_p: tasks_lib.SingleTask.HParams,
                      learning_rate: float,
                      weight_decay: float,
                      *,
@@ -94,7 +94,7 @@ def set_default_adam(task_p: base_task.BaseTask.HParams,
     decay_start: The step at which to start decaying the learning rate.
     decay_end: The step at which to end the learning rate decay.
   """
-  lp = task_p.train.learner  # pytype: disable=attribute-error  # enable-nested-classes
+  lp = task_p.train.learner
   lp.loss_name = 'total_loss'
   lp.optimizer = optimizers.Adam.HParams(
       beta1=0.9,
@@ -111,7 +111,7 @@ def set_default_adam(task_p: base_task.BaseTask.HParams,
           max=1.0))
 
 
-def set_default_adafactor(task_p: base_task.BaseTask.HParams,
+def set_default_adafactor(task_p: tasks_lib.SingleTask.HParams,
                           learning_rate: float,
                           weight_decay: float,
                           *,
@@ -130,7 +130,7 @@ def set_default_adafactor(task_p: base_task.BaseTask.HParams,
     decay_end: The step at which to end the learning rate decay.
     clip_gradient_norm_to_value: clip_gradient_norm_to_value.
   """
-  lp = task_p.train.learner  # pytype: disable=attribute-error  # enable-nested-classes
+  lp = task_p.train.learner
   lp.loss_name = 'total_loss'
   lp.optimizer = optimizers.ShardedAdafactor.HParams(
       decay_method='adam',
@@ -155,7 +155,7 @@ def maybe_setup_moe_params(model_p: base_model.BaseModel.HParams) -> None:
     model_p = model_p.block
 
   if model_p.num_experts == 0:
-    return model_p  # pytype: disable=bad-return-type  # enable-nested-classes
+    return
 
   ff_p = model_p.transformer_layer_params_tpl.tr_fflayer_tpl
   assert issubclass(ff_p.cls, layers.TransformerFeedForward)
@@ -168,7 +168,8 @@ def maybe_setup_moe_params(model_p: base_model.BaseModel.HParams) -> None:
   moe_p.input_dims = ff_p.input_dims
   moe_p.hidden_dims = ff_p.hidden_dims
   moe_p.ln_tpl = ff_p.ln_tpl.Copy()
-  moe_p.activation = ff_p.activation
+  moe_p.activation_tpl = ff_p.activation_tpl.clone()
+  moe_p.use_gated_activation = ff_p.use_gated_activation
   moe_p.relu_dropout_tpl = ff_p.relu_dropout_tpl.Copy()
   moe_p.relu_dropout_prob = ff_p.relu_dropout_prob
   moe_p.residual_dropout_tpl = ff_p.residual_dropout_tpl.Copy()
@@ -195,7 +196,7 @@ class ClassificationModelAdam(base_experiment.BaseExperiment):
   MESH_SHAPE = None
   TRAINING_OPTIMIZED_SHARDING = True
 
-  def task(self) -> base_task.BaseTask.HParams:
+  def task(self) -> tasks_lib.SingleTask.HParams:
     task_p = tasks_lib.SingleTask.HParams(name='classification_task')
     task_p.model = models.ClassificationMLPModel.HParams(
         name='classification_model')
@@ -233,14 +234,15 @@ class TransformerBertPmapAdam(base_experiment.BaseExperiment):
   WEIGHT_DECAY = 1e-3
   USE_REPEATED_LAYER = False
   CHECKPOINT_POLICY = layers.AutodiffCheckpointType.SAVE_DOT_WITH_NO_BATCH_DIM
-  ACTIVATION_FUNCTION = 'RELU'
+  ACTIVATION_CLS = activations.ReLU
+  USE_GATED_ACTIVATION = False
   # Save a checkpoint every n steps.
   CHECKPOINT_EVERY_N_STEPS = 5000
   DECAY_END = 300000
 
   ENABLE_BFLOAT16 = True
 
-  def task(self) -> base_task.BaseTask.HParams:
+  def task(self) -> tasks_lib.SingleTask.HParams:
     """Returns the task parameters."""
     task_p = tasks_lib.SingleTask.HParams(name='bert_task')
     task_p.model = models.BertModel.HParams(name='bert_lm')
@@ -263,7 +265,10 @@ class TransformerBertPmapAdam(base_experiment.BaseExperiment):
     transformer_layer_p = (stacked_transformer_tpl.transformer_layer_params_tpl)
     transformer_layer_p.tr_atten_tpl.atten_logit_cap = 50.0
     transformer_layer_p.tr_atten_tpl.use_bias = False
-    transformer_layer_p.tr_fflayer_tpl.activation = self.ACTIVATION_FUNCTION
+    transformer_layer_p.tr_fflayer_tpl.activation_tpl = (
+        getattr(self.ACTIVATION_CLS, 'HParams')())
+    transformer_layer_p.tr_fflayer_tpl.use_gated_activation = (
+        self.USE_GATED_ACTIVATION)
 
     if self.USE_REPEATED_LAYER:
       model_p.lm.stacked_transformer_tpl = (
@@ -310,7 +315,8 @@ class TransformerBertSpmdAdafactor(base_experiment.BaseExperiment):
   MASK_TOKEN_ID = 0
   DECAY_END = 100000
 
-  ACTIVATION_FUNCTION = 'RELU'
+  ACTIVATION_CLS = activations.ReLU
+  USE_GATED_ACTIVATION = False
 
   # Sub-class has to specify a mesh.
   MESH_SHAPE = None
@@ -320,7 +326,7 @@ class TransformerBertSpmdAdafactor(base_experiment.BaseExperiment):
   CHECKPOINT_EVERY_N_STEPS = 500
   CHECKPOINT_SAVE_MAX_TO_KEEP = 10
 
-  def task(self) -> base_task.BaseTask.HParams:
+  def task(self) -> tasks_lib.SingleTask.HParams:
     """Returns the task parameters."""
     task_p = tasks_lib.SingleTask.HParams(name='bert_task')
     task_p.model = models.BertModel.HParams(name='bert_lm')
@@ -344,7 +350,10 @@ class TransformerBertSpmdAdafactor(base_experiment.BaseExperiment):
     transformer_layer_p.tr_atten_tpl.atten_logit_cap = 50.0
     transformer_layer_p.tr_atten_tpl.use_bias = False
     transformer_layer_p.tr_atten_tpl.combine_qkv = True
-    transformer_layer_p.tr_fflayer_tpl.activation = self.ACTIVATION_FUNCTION
+    transformer_layer_p.tr_fflayer_tpl.activation_tpl = (
+        getattr(self.ACTIVATION_CLS, 'HParams')())
+    transformer_layer_p.tr_fflayer_tpl.use_gated_activation = (
+        self.USE_GATED_ACTIVATION)
 
     if self.USE_REPEATED_LAYER:
       model_p.lm.stacked_transformer_tpl = (
@@ -390,14 +399,15 @@ class TransformerLmPmapAdam(base_experiment.BaseExperiment):
   LEARNING_RATE = 1e-3
   WEIGHT_DECAY = 1e-3
   USE_REPEATED_LAYER = False
-  ACTIVATION_FUNCTION = 'RELU'
+  ACTIVATION_CLS = activations.ReLU
+  USE_GATED_ACTIVATION = False
   DECAY_END = 300000
 
   PACKED_INPUT = True
   ATTEN_LOGIT_CAP = 50.0
   USE_BIAS = False
 
-  def task(self) -> base_task.BaseTask.HParams:
+  def task(self) -> tasks_lib.SingleTask.HParams:
     """Returns the task parameters."""
     task_p = tasks_lib.SingleTask.HParams(name='xformer_task')
     task_p.model = models.LanguageModel.HParams(name='xformer_lm')
@@ -418,7 +428,10 @@ class TransformerLmPmapAdam(base_experiment.BaseExperiment):
     transformer_layer_p = (stacked_transformer_tpl.transformer_layer_params_tpl)
     transformer_layer_p.tr_atten_tpl.atten_logit_cap = self.ATTEN_LOGIT_CAP
     transformer_layer_p.tr_atten_tpl.use_bias = self.USE_BIAS
-    transformer_layer_p.tr_fflayer_tpl.activation = self.ACTIVATION_FUNCTION
+    transformer_layer_p.tr_fflayer_tpl.activation_tpl = (
+        getattr(self.ACTIVATION_CLS, 'HParams')())
+    transformer_layer_p.tr_fflayer_tpl.use_gated_activation = (
+        self.USE_GATED_ACTIVATION)
 
     if self.USE_REPEATED_LAYER:
       model_p.lm.stacked_transformer_tpl = (
@@ -459,7 +472,8 @@ class TransformerLmSpmdAdafactor(base_experiment.BaseExperiment):
   NORM_POLICY = 'pre'
   ENABLE_DCONV = False
   COMBINE_QKV = True
-  ACTIVATION = 'RELU'
+  ACTIVATION_CLS = activations.ReLU
+  USE_GATED_ACTIVATION = False
   DECAY_END = 100000
 
   # optimizer related
@@ -483,7 +497,7 @@ class TransformerLmSpmdAdafactor(base_experiment.BaseExperiment):
   DCN_MESH_SHAPE = [1, 1, 1]
   TRAINING_OPTIMIZED_SHARDING = True
 
-  def task(self) -> base_task.BaseTask.HParams:
+  def task(self) -> tasks_lib.SingleTask.HParams:
     """Returns the task parameters."""
     if self.DIMS_PER_HEAD is not None:
       if self.NUM_HEADS is None:
@@ -527,7 +541,10 @@ class TransformerLmSpmdAdafactor(base_experiment.BaseExperiment):
     transformer_layer_p.norm_policy = self.NORM_POLICY
     transformer_layer_p.tr_atten_tpl.use_bias = False
     transformer_layer_p.tr_atten_tpl.combine_qkv = self.COMBINE_QKV
-    transformer_layer_p.tr_fflayer_tpl.activation = self.ACTIVATION
+    transformer_layer_p.tr_fflayer_tpl.activation_tpl = (
+        getattr(self.ACTIVATION_CLS, 'HParams')())
+    transformer_layer_p.tr_fflayer_tpl.use_gated_activation = (
+        self.USE_GATED_ACTIVATION)
     transformer_layer_p.tr_atten_tpl.dconv_qkv = self.ENABLE_DCONV
     # pytype: enable=attribute-error  # enable-nested-classes
 
@@ -592,7 +609,8 @@ class TransformerLmSpmdPipelineAdafactor(TransformerLmSpmdAdafactor):
   NORM_POLICY = 'pre'
   ENABLE_DCONV = False
   COMBINE_QKV = True
-  ACTIVATION = 'RELU'
+  ACTIVATION_CLS = activations.ReLU
+  USE_GATED_ACTIVATION = False
 
   # optimizer related
   DROPOUT_PROB = 0.0
@@ -630,7 +648,7 @@ class TransformerLmSpmdPipelineAdafactor(TransformerLmSpmdAdafactor):
   # for DCN.
   STREAM_IO = False
 
-  def task(self) -> base_task.BaseTask.HParams:
+  def task(self) -> tasks_lib.SingleTask.HParams:
     """Returns the task parameters."""
     if self.DIMS_PER_HEAD is not None:
       if self.NUM_HEADS is None:
@@ -682,7 +700,10 @@ class TransformerLmSpmdPipelineAdafactor(TransformerLmSpmdAdafactor):
     transformer_layer_p.norm_policy = self.NORM_POLICY
     transformer_layer_p.tr_atten_tpl.use_bias = False
     transformer_layer_p.tr_atten_tpl.combine_qkv = self.COMBINE_QKV
-    transformer_layer_p.tr_fflayer_tpl.activation = self.ACTIVATION
+    transformer_layer_p.tr_fflayer_tpl.activation_tpl = (
+        getattr(self.ACTIVATION_CLS, 'HParams')())
+    transformer_layer_p.tr_fflayer_tpl.use_gated_activation = (
+        self.USE_GATED_ACTIVATION)
     transformer_layer_p.tr_atten_tpl.dconv_qkv = self.ENABLE_DCONV
     # pytype: enable=attribute-error  # enable-nested-classes
 

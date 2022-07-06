@@ -20,8 +20,8 @@ from typing import List
 import jax
 from jax import numpy as jnp
 from paxml import base_experiment
-from paxml import base_task
 from paxml import experiment_registry
+from paxml import tasks_lib
 from paxml.tasks.lm import input_generator
 from paxml.tasks.lm import model_params
 from praxis import base_input
@@ -112,12 +112,13 @@ class LmCloudSpmd(model_params.TransformerLmSpmdAdafactor, SyntheticDataset):
   NUM_LAYERS = 10
   MODEL_DIMS = 2048
   HIDDEN_DIMS = MODEL_DIMS * 4
-  ACTIVATION = 'GELU'
+  ACTIVATION_CLS = layers.GELU
+  USE_GATED_ACTIVATION = False
 
   # Autodiff remat.
   CHECKPOINT_POLICY = layers.AutodiffCheckpointType.SAVE_NOTHING
 
-  def task(self) -> base_task.BaseTask.HParams:
+  def task(self) -> tasks_lib.SingleTask.HParams:
     """Returns the task parameters."""
     task_p = super().task()
     model_params.set_default_adam(task_p, self.LEARNING_RATE, self.WEIGHT_DECAY)
@@ -259,7 +260,8 @@ class LmCloudSpmdPipeline(model_params.TransformerLmSpmdPipelineAdafactor,
   NUM_LAYERS = 10
   MODEL_DIMS = 2048
   HIDDEN_DIMS = MODEL_DIMS * 4
-  ACTIVATION = 'GELU'
+  ACTIVATION_CLS = layers.GELU
+  USE_GATED_ACTIVATION = False
 
   # Autodiff remat.
   CHECKPOINT_POLICY = layers.AutodiffCheckpointType.SAVE_NOTHING
@@ -267,7 +269,7 @@ class LmCloudSpmdPipeline(model_params.TransformerLmSpmdPipelineAdafactor,
   MICROBATCH_SIZE = None
   NUM_STAGES = None
 
-  def task(self) -> base_task.BaseTask.HParams:
+  def task(self) -> tasks_lib.SingleTask.HParams:
     """Returns the task parameters."""
     task_p = super().task()
     model_params.set_default_adam(task_p, self.LEARNING_RATE, self.WEIGHT_DECAY)
