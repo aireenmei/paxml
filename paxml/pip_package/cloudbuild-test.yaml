@@ -15,7 +15,7 @@ substitutions:
     _RELEASE_VERSION: 'nightly'  # or rX.Y
     _BUILD_DATE: "$(date -u '+%Y%m%d')"
     _IMAGE_NAME: '${_RELEASE_VERSION}_${_PYTHON_VERSION}'
-    _UPLOAD_SUBDIR: "$(date -u '+%Y%m%d')"
+#    _UPLOAD_SUBDIR: "$(date -u '+%Y%m%d')"
 options:
     dynamic_substitutions: true
     substitution_option: 'ALLOW_LOOSE'
