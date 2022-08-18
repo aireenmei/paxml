@@ -6,7 +6,7 @@ steps:
           '--build-arg', 'release_version=${_RELEASE_VERSION}',
           '-t', 'gcr.io/${PROJECT_ID}/paxml:${_IMAGE_NAME}',
           '--cache-from', 'gcr.io/$PROJECT_ID/paxml:${_IMAGE_NAME}',
-          '-f', 'pip_package/test.Dockerfile', '.'
+          '-f', 'paxml/pip_package/test.Dockerfile', '.'
         ]
   timeout: 14400s
 
