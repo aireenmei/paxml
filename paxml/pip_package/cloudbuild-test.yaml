@@ -1,0 +1,22 @@
+steps:
+- name: 'gcr.io/cloud-builders/docker'
+  args: [
+          'build',
+          '--build-arg', 'python_version=${_PYTHON_VERSION}',
+          '--build-arg', 'release_version=${_RELEASE_VERSION}',
+          '-t', 'gcr.io/${PROJECT_ID}/paxml:${_IMAGE_NAME}',
+          '--cache-from', 'gcr.io/$PROJECT_ID/paxml:${_IMAGE_NAME}',
+          '-f', 'pip_package/test.Dockerfile', '.'
+        ]
+  timeout: 14400s
+
+substitutions:
+    _PYTHON_VERSION: '3.8'
+    _RELEASE_VERSION: 'nightly'  # or rX.Y
+    _BUILD_DATE: "$(date -u '+%Y%m%d')"
+    _IMAGE_NAME: '${_RELEASE_VERSION}_${_PYTHON_VERSION}'
+    _UPLOAD_SUBDIR: "$(date -u '+%Y%m%d')"
+options:
+    dynamic_substitutions: true
+    substitution_option: 'ALLOW_LOOSE'
+timeout: 24000s
