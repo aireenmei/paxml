@@ -9,6 +9,9 @@ LABEL maintainer="Pax team <pax-dev@google.com>"
 ARG cpu_base_image="ubuntu:20.04"
 ARG base_image=$cpu_base_image
 
+ENV PYTHON_VERSION="3"
+ENV PYTHON_MINOR_VERSION="8"
+
 # Pick up some TF dependencies
 RUN apt update && DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends software-properties-common
 RUN apt update && DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
@@ -61,22 +64,15 @@ RUN mkdir /bazel && \
     cd / && \
     rm -f /bazel/bazel-$BAZEL_VERSION-installer-linux-x86_64.sh
 
-RUN git clone https://github.com/google/paxml.git
-RUN git clone https://github.com/google/praxis.git
 
-RUN mv praxis/praxis /paxml/
-
+COPY . /paxml
 RUN pip3 install paxml/paxml/pip_package
-RUN pip3 install paxml/praxis/pip_package
 
 RUN git clone https://github.com/google/flaxformer.git
 RUN cd flaxformer && pip3 install .
 
-RUN pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-RUN pip3 install fiddle-config tensorstore
-RUN pip3 uninstall -y seqio seqio-nightly
-# Need tensor2tensor explicitly because seqio implicitly dep on tensor2tensor.
-RUN pip3 install -U seqio-nightly tensor2tensor
+RUN mv paxml/paxml/pip_package /paxml/
+RUN cd /paxml && bash pip_package/build.sh
 
 WORKDIR "/paxml"
 
