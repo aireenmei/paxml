@@ -14,7 +14,7 @@ steps:
 - name: 'gcr.io/cloud-builders/docker'
   args: ['push', '--all-tags', 'gcr.io/${PROJECT_ID}/paxml']
   timeout: 1800s
-- name: 'gcr.io/${PROJECT_ID}/paxml:${_IMAGE_NAME}_$(date -u +%Y%m%d)'
+- name: 'gcr.io/${PROJECT_ID}/paxml:${_IMAGE_NAME}'
   entrypoint: 'bash'
   args: ['-c', 'source ./collect_wheels.sh && collect_wheels ${_RELEASE_VERSION}']
 
