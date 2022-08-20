@@ -66,7 +66,7 @@ RUN mkdir /bazel && \
 
 
 COPY . /paxml
-
+RUN cd paxml && git checkout 61e40c96176dc59f7b81969ce5b7a2ec1cf1d7ab
 RUN pip3 install paxml/paxml/pip_package
 
 RUN git clone https://github.com/google/flaxformer.git
