@@ -66,6 +66,10 @@ RUN mkdir /bazel && \
 
 
 COPY . /paxml
+RUN git clone https://github.com/google/praxis.git
+RUN cd praxis && git checkout d13f6d056dc1fef8858e7cc2d9eb572e6d9e3a7c
+RUN mv praxis/praxis /paxml/
+
 RUN pip3 install paxml/paxml/pip_package
 
 RUN git clone https://github.com/google/flaxformer.git
