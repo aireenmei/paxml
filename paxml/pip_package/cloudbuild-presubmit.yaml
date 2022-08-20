@@ -18,7 +18,6 @@ substitutions:
     _PYTHON_VERSION: '3.8'
     _RELEASE_VERSION: 'nightly'  # or rX.Y
     _IMAGE_NAME: '${_RELEASE_VERSION}_${_PYTHON_VERSION}'
-    _UPLOAD_SUBDIR: "20220819"
 options:
     dynamic_substitutions: true
     substitution_option: 'ALLOW_LOOSE'
