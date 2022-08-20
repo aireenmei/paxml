@@ -82,7 +82,7 @@ write_action_env_to_bazelrc "TF_NEED_CUDA" ${TF_NEED_CUDA}
 # It is expected that you have git cloned this repo at the branch you want,
 # ideally in our docker.
 
-bazel clean
+#bazel clean
 bazel build ...
 # Todo: add bazel test for the purposes of the pip package.
 
