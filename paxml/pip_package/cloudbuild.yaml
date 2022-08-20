@@ -16,7 +16,7 @@ steps:
   timeout: 1800s
 - name: 'gcr.io/${PROJECT_ID}/paxml:${_IMAGE_NAME}'
   entrypoint: 'bash'
-  args: ['-c', 'source ./collect_wheels.sh && collect_wheels ${_RELEASE_VERSION}']
+  args: ['-c', 'source paxml/pip_package/collect_wheels.sh && collect_wheels ${_RELEASE_VERSION}']
 
 substitutions:
     _PYTHON_VERSION: '3.8'
