@@ -1,0 +1,25 @@
+steps:
+- name: 'gcr.io/kaniko-project/executor:latest'
+  args:
+  - --destination=gcr.io/${PROJECT_ID}/paxml_${_IMAGE_NAME}
+  - --cache=true
+  - --cache-ttl=24h
+  - --dockerfile=./paxml/pip_package/Dockerfile
+
+- name: 'gcr.io/${PROJECT_ID}/paxml_${_IMAGE_NAME}'
+  entrypoint: 'bash'
+  args:
+  - -c='source paxml/pip_package/collect_wheels.sh && collect_wheels ${_RELEASE_VERSION}'
+
+substitutions:
+    _PYTHON_VERSION: '3.8'
+    _RELEASE_VERSION: 'nightly'  # or rX.Y
+    _IMAGE_NAME: '${_RELEASE_VERSION}_${_PYTHON_VERSION}'
+options:
+    dynamic_substitutions: true
+    substitution_option: 'ALLOW_LOOSE'
+timeout: 24000s
+artifacts:
+  objects:
+    location: 'gs://pax-on-cloud-tpu-project/wheels/$(date -u +%Y%m%d)'
+    paths: ['/**/*.whl']
