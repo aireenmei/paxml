@@ -1,25 +1,26 @@
 steps:
 - name: 'gcr.io/cloud-builders/docker'
   entrypoint: 'bash'
-  args: ['-c', 'docker pull gcr.io/${PROJECT_ID}/paxml:${_IMAGE_NAME} || exit 0']
-- name: 'gcr.io/${PROJECT_ID}/paxml_${_IMAGE_NAME}'
-  entrypoint: 'bash'
-  args: ['-c', 'cp . /paxml && mv paxml/paxml/pip_package /paxml/',
-         '-c', 'cd /paxml && bazel build ...',
-  ]
+  args: ['-c', 'docker pull gcr.io/${PROJECT_ID}/paxml_${_IMAGE_NAME}:latest || exit 0']
+# - name: 'gcr.io/${PROJECT_ID}/paxml_${_IMAGE_NAME}'
+#   entrypoint: 'bash'
+#   args: ['-c', 'cp . /paxml && mv paxml/paxml/pip_package /paxml/',
+#          '-c', 'cd /paxml && bazel build ...',
+#   ]
   
-#  args: ['-c', 'source paxml/pip_package/collect_wheels.sh && collect_wheels ${_RELEASE_VERSION}']
-# - name: 'gcr.io/cloud-builders/docker'
-#   args: [
-#           'build',
+# args: ['-c', 'source paxml/pip_package/collect_wheels.sh && collect_wheels ${_RELEASE_VERSION}']
+- name: 'gcr.io/cloud-builders/docker'
+  args: [
+          'build',
 #           '--build-arg', 'python_version=${_PYTHON_VERSION}',
 #           '--build-arg', 'release_version=${_RELEASE_VERSION}',
 #           '--build-arg', 'pre_submit=true',
-#           '-t', 'gcr.io/${PROJECT_ID}/paxml_${_IMAGE_NAME}',
-#           '--cache-from', 'gcr.io/${PROJECT_ID}/paxml_${_IMAGE_NAME}:latest',
-#           '-f', 'paxml/pip_package/Dockerfile', '.'
-#         ]
-  timeout: 14400s
+          '-t', 'gcr.io/${PROJECT_ID}/paxml_${_IMAGE_NAME}',
+          '--cache-from', 'gcr.io/${PROJECT_ID}/paxml_${_IMAGE_NAME}:latest',
+          '-f', 'paxml/pip_package/Dockerfile', '.'
+        ]
+timeout: 600s
+#timeout: 14400s
 
 substitutions:
     _PYTHON_VERSION: '3.8'
