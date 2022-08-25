@@ -78,6 +78,6 @@ RUN cd flaxformer && pip3 install .
 RUN mv paxml/paxml/pip_package /paxml/
 RUN cd /paxml && bash pip_package/build.sh
 
-WORKDIR "/paxml"
+WORKDIR /
 
 CMD ["/bin/bash"]
