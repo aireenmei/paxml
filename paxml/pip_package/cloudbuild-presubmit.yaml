@@ -4,7 +4,11 @@ steps:
   args: ['-c', 'docker pull gcr.io/${PROJECT_ID}/paxml:${_IMAGE_NAME} || exit 0']
 - name: 'gcr.io/${PROJECT_ID}/paxml_${_IMAGE_NAME}'
   entrypoint: 'bash'
-  args: ['-c', 'source paxml/pip_package/collect_wheels.sh && collect_wheels ${_RELEASE_VERSION}']
+  args: ['-c', 'cp . /paxml && mv paxml/paxml/pip_package /paxml/',
+         '-c', 'cd /paxml && bazel build ...',
+  ]
+  
+#  args: ['-c', 'source paxml/pip_package/collect_wheels.sh && collect_wheels ${_RELEASE_VERSION}']
 # - name: 'gcr.io/cloud-builders/docker'
 #   args: [
 #           'build',
@@ -24,8 +28,8 @@ substitutions:
 options:
     dynamic_substitutions: true
     substitution_option: 'ALLOW_LOOSE'
-artifacts:
-  objects:
-    location: 'gs://pax-on-cloud-tpu-project/wheels/$(date -u +%Y%m%d)'
-    paths: ['/**/*.whl']
+# artifacts:
+#   objects:
+#     location: 'gs://pax-on-cloud-tpu-project/wheels/$(date -u +%Y%m%d)'
+#     paths: ['/**/*.whl']
 timeout: 24000s
