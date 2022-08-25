@@ -2,16 +2,19 @@ steps:
 - name: 'gcr.io/cloud-builders/docker'
   entrypoint: 'bash'
   args: ['-c', 'docker pull gcr.io/${PROJECT_ID}/paxml:${_IMAGE_NAME} || exit 0']
-- name: 'gcr.io/cloud-builders/docker'
-  args: [
-          'build',
-          '--build-arg', 'python_version=${_PYTHON_VERSION}',
-          '--build-arg', 'release_version=${_RELEASE_VERSION}',
-          '--build-arg', 'pre_submit=true',
-          '-t', 'gcr.io/${PROJECT_ID}/paxml_${_IMAGE_NAME}',
-          '--cache-from', 'gcr.io/${PROJECT_ID}/paxml_${_IMAGE_NAME}:latest',
-          '-f', 'paxml/pip_package/Dockerfile', '.'
-        ]
+- name: 'gcr.io/${PROJECT_ID}/paxml_${_IMAGE_NAME}'
+  entrypoint: 'bash'
+  args: ['-c', 'source paxml/pip_package/collect_wheels.sh && collect_wheels ${_RELEASE_VERSION}']
+# - name: 'gcr.io/cloud-builders/docker'
+#   args: [
+#           'build',
+#           '--build-arg', 'python_version=${_PYTHON_VERSION}',
+#           '--build-arg', 'release_version=${_RELEASE_VERSION}',
+#           '--build-arg', 'pre_submit=true',
+#           '-t', 'gcr.io/${PROJECT_ID}/paxml_${_IMAGE_NAME}',
+#           '--cache-from', 'gcr.io/${PROJECT_ID}/paxml_${_IMAGE_NAME}:latest',
+#           '-f', 'paxml/pip_package/Dockerfile', '.'
+#         ]
   timeout: 14400s
 
 substitutions:
@@ -21,4 +24,8 @@ substitutions:
 options:
     dynamic_substitutions: true
     substitution_option: 'ALLOW_LOOSE'
+artifacts:
+  objects:
+    location: 'gs://pax-on-cloud-tpu-project/wheels/$(date -u +%Y%m%d)'
+    paths: ['/**/*.whl']
 timeout: 24000s
