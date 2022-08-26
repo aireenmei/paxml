@@ -4,11 +4,11 @@ FROM $base_image
 
 RUN rm -rf /praxis && rm -rf /paxml/paxml && rm -rf /paxml/praxis
 COPY . /paxml_new
-RUN cd /paxml_new/paxml && git checkout main
 RUN git clone https://github.com/google/praxis.git
 #RUN cd /praxis && git checkout d13f6d056dc1fef8858e7cc2d9eb572e6d9e3a7c
 RUN mv /praxis/praxis /paxml/ && mv /paxml_new/paxml /paxml/
-
+RUN pip install /paxml/praxis/pip_package
+RUN pip install /paxml/paxml/pip_package --test
 RUN cd /paxml && bazel build ...
 
 WORKDIR /
