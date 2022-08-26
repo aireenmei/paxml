@@ -8,7 +8,7 @@ RUN git clone https://github.com/google/praxis.git
 #RUN cd /praxis && git checkout d13f6d056dc1fef8858e7cc2d9eb572e6d9e3a7c
 RUN mv /praxis/praxis /paxml/ && mv /paxml_new/paxml /paxml/
 RUN pip install /paxml/praxis/pip_package
-RUN pip install /paxml/paxml/pip_package --test
+RUN pip install /paxml/paxml/pip_package
 RUN cd /paxml && bazel build ...
 
 WORKDIR /
