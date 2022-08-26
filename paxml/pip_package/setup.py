@@ -21,6 +21,7 @@ from setuptools import setup, find_namespace_packages
 dependencies = ['praxis']
 if '--test' in sys.argv:
   dependencies = []
+  sys.argv.remove('--test')
 
 dependencies += [
     'pyglove', 'absl-py', 'jax', 'tensorflow==2.7.3', 'tensorflow-text==2.7.3',
