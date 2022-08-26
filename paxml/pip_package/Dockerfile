@@ -66,10 +66,10 @@ RUN mkdir /bazel && \
 
 
 COPY . /paxml
-RUN git clone https://github.com/google/praxis.git
-RUN cd praxis && git checkout d13f6d056dc1fef8858e7cc2d9eb572e6d9e3a7c
-RUN mv praxis/praxis /paxml/
+RUN git clone --branch cloudbuild-test https://github.com/aireenmei/praxis.git
+RUN cp -r praxis/praxis /paxml/
 
+RUN pip3 install paxml/praxis/pip_package
 RUN pip3 install paxml/paxml/pip_package
 
 RUN git clone https://github.com/google/flaxformer.git
@@ -77,6 +77,7 @@ RUN cd flaxformer && pip3 install .
 
 RUN mv paxml/paxml/pip_package /paxml/
 RUN cd /paxml && bash pip_package/build.sh
+RUN cd praxis && bash praxis/pip_package/build_pip_pkg.sh  
 
 WORKDIR /
 
