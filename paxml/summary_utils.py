@@ -17,15 +17,17 @@
 
 import collections
 import collections.abc
+import concurrent
 import contextlib
 import operator
 import textwrap
 import typing
-from typing import Any, Dict, Generator, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Generator, Iterator, List, Optional, Sequence, Tuple, Union
 
 from absl import flags
 from absl import logging
 from clu import platform
+from etils import epath
 import flax
 import jax
 from jax import numpy as jnp
@@ -55,6 +57,7 @@ PMAP_PARALLEL_AXIS_NAME = base_layer.PMAP_PARALLEL_AXIS_NAME
 
 # Maximum number of images written to a single summary entry.
 MAX_IMAGES_PER_SUMMARY = 64
+MAX_AUDIOS_PER_SUMMARY = 64
 MAX_TEXTS_PER_SUMMARY = 64
 
 
@@ -207,12 +210,15 @@ def aggregate_per_replica_summaries(summary_tensors: NestedJTensor):
   """Aggregates summaries from different replicas in pmap."""
   scalar_summaries = {}
   image_summaries = {}
+  audio_summaries = {}
   for k, v in summary_tensors.items():
     summary_type = base_layer.get_summary_type_from_key(k)
     if base_layer.get_summary_base_type(summary_type) == SummaryType.SCALAR:
       scalar_summaries[k] = v
     elif base_layer.get_summary_base_type(summary_type) == SummaryType.IMAGE:
       image_summaries[k] = v
+    elif base_layer.get_summary_base_type(summary_type) == SummaryType.AUDIO:
+      audio_summaries[k] = v
 
   # Compute the mean of scalars.
   scalar_summaries = jax.lax.pmean(
@@ -225,21 +231,27 @@ def aggregate_per_replica_summaries(summary_tensors: NestedJTensor):
   image_summaries = jax.tree_map(
       lambda x: jnp.reshape(x, [-1] + list(x.shape)[-3:])[:max_entries],
       image_summaries)
+  audio_summaries = jax.tree_map(
+      lambda x: jax.lax.all_gather(x, axis_name=PMAP_PARALLEL_AXIS_NAME),
+      audio_summaries)
+  max_entries = MAX_AUDIOS_PER_SUMMARY
+  audio_summaries = jax.tree_map(
+      lambda x: jnp.reshape(x, [-1] + list(x.shape[-2:]))[:max_entries],
+      audio_summaries)
 
   summary_tensors = summary_tensors.copy()
-  for k, v in scalar_summaries.items():
-    summary_tensors[k] = v
-  for k, v in image_summaries.items():
-    summary_tensors[k] = v
+  for summary_dict in (scalar_summaries, image_summaries, audio_summaries):
+    for k, v in summary_dict.items():
+      summary_tensors[k] = v
   return summary_tensors
 
 
 @contextlib.contextmanager
-def get_summary_writer(summary_dir: str) -> SummaryWriter:
+def get_summary_writer(summary_dir: epath.Path) -> Iterator[SummaryWriter]:
   """Context manager around Tensorflow's SummaryWriter."""
   if jax.process_index() == 0:
     logging.info('Opening SummaryWriter `%s`...', summary_dir)
-    summary_writer = tf_summary.create_file_writer(summary_dir)
+    summary_writer = tf_summary.create_file_writer(str(summary_dir))
   else:
     # We create a dummy tf.summary.SummaryWriter() on non-zero tasks. This will
     # return a mock object, which acts like a summary writer, but does nothing,
@@ -259,11 +271,10 @@ def get_summary_writer(summary_dir: str) -> SummaryWriter:
 def flatten_summary_dict(summary_dict: Dict[str, JTensor],
                          parent_key: Optional[str] = None) -> List[Any]:
   """Flattens a summary dictionary."""
-  separator = '@'
   outputs = []
   for key, value in summary_dict.items():
     if parent_key is not None:
-      key = f'{parent_key}{separator}{key}'
+      key = f'{parent_key}{key}'
     if isinstance(value, collections.abc.MutableMapping):
       outputs.extend(flatten_summary_dict(value, key))
     else:
@@ -276,7 +287,9 @@ def write_summary_tensor(step_i: int, key: str,
                          summary_type: SummaryType) -> bool:
   """Writes summary in relevant processes."""
   if FLAGS.pax_only_aggregate_summaries:
-    if summary_type == SummaryType.SCALAR or summary_type == SummaryType.IMAGE:
+    if summary_type in {
+        SummaryType.SCALAR, SummaryType.IMAGE, SummaryType.AUDIO
+    }:
       return
   if isinstance(tensor, (list, tuple)):
     tensors = tensor
@@ -303,6 +316,16 @@ def write_summary_tensor(step_i: int, key: str,
       for i in range(min(tensor.shape[0], remaining_max_images)):
         tf_summary.image(f'{key}/{i}', tensor[i:i + 1], step_i)
       remaining_max_images -= tensor.shape[0]
+  elif base_layer.get_summary_base_type(summary_type) == SummaryType.AUDIO:
+    remaining_max_audios = MAX_AUDIOS_PER_SUMMARY
+    for tensor in tensors_it:
+      if remaining_max_audios <= 0:
+        break
+      tensor = np.reshape(tensor, [-1] + list(tensor.shape[-2:]))
+      # TODO(nanxinchen): Make the sampling rate configurable
+      for i in range(min(tensor.shape[0], remaining_max_audios)):
+        tf_summary.audio(f'{key}/{i}', tensor[i:i + 1], 44000, step_i)
+      remaining_max_audios -= tensor.shape[0]
   elif base_layer.get_summary_base_type(summary_type) == SummaryType.TEXT:
     remaining_max_texts = MAX_TEXTS_PER_SUMMARY
     for tensor in tensors_it:
@@ -337,11 +360,12 @@ def write_summary_entry(summary_writer: SummaryWriter,
   mean_loss = np.mean(loss).item()
   with summary_writer.as_default():
     status_msg = f'step = {step_i}, loss= {mean_loss}'
-    write_summary_tensor(step_i, 'loss', mean_loss, SummaryType.SCALAR)
+    write_summary_tensor(step_i, 'loss', mean_loss,
+                         SummaryType.AGGREGATE_SCALAR)
     if steps_per_sec is not None:
       status_msg += f', steps/sec {steps_per_sec}'
       write_summary_tensor(step_i, 'Steps/sec', steps_per_sec,
-                           SummaryType.SCALAR)
+                           SummaryType.AGGREGATE_SCALAR)
     logging.info('Metrics values at step %d:', step_i)
     logging.info('  loss=%f', mean_loss)
     for key, value_lst in weighted_scalars_list.items():
@@ -413,7 +437,10 @@ class SummaryHandler:
   def __init__(self,
                summary_writer: SummaryWriter,
                write_interval_steps: int,
-               accumulate_interval_steps: Optional[int] = None) -> None:
+               accumulate_interval_steps: Optional[int] = None,
+               log_interval_steps: Optional[int] = None,
+               is_async: bool = False,
+               name: str = '') -> None:
     """Constructor.
 
     Args:
@@ -423,15 +450,37 @@ class SummaryHandler:
       accumulate_interval_steps: The frequency at which to accumulate summaries
         across steps. If unset, do not accumulate and only use the values at a
         specific set.
+      log_interval_steps: The interval to log step outputs. If not set, always
+        log.
+      is_async: Whether to process summaries asynchronously.
+      name: Name of the handler.
     """
     self._summary_writer = summary_writer
     self._write_interval_steps = write_interval_steps
     self._accumulate_interval_steps = accumulate_interval_steps
+    self._log_interval_steps = log_interval_steps
+    self._name = name
+    # When is_async is true, only update the following fields in the
+    # SummaryHandler thread to make sure that they are thread safe.
     self._latest_step = -1
     self._losses = []
     self._weighted_scalars_list = collections.defaultdict(list)
     self._summary_tensors = collections.defaultdict(list)
     self._steps_per_sec = []
+
+    if is_async:
+      self._summary_pool = concurrent.futures.ThreadPoolExecutor(
+          max_workers=1, thread_name_prefix='SummaryHandler')
+    else:
+      self._summary_pool = None
+
+  def __del__(self):
+    self.close()
+
+  def close(self):
+    """Shutdown the thread pool if processing summaries asynchronously."""
+    if self._summary_pool:
+      self._summary_pool.shutdown(wait=True)
 
   @property
   def accumulate_over_steps(self) -> bool:
@@ -447,11 +496,19 @@ class SummaryHandler:
     """Indicates whether we should write summaries to disk at this step."""
     return step % self._write_interval_steps == 0
 
+  def should_log(self, step: int) -> bool:
+    """Indicates whether to log the step outputs."""
+    if self._log_interval_steps:
+      return step % self._log_interval_steps == 0
+    else:
+      return True
+
   def process(self,
               step: int,
               loss: JTensor,
               weighted_scalars: WeightedScalars,
               summary_tensors: NestedJTensor,
+              per_example_out: Optional[NestedJTensor] = None,
               steps_per_sec: Optional[float] = None) -> bool:
     """Adds summaries for a given step and indicates if summaries were written.
 
@@ -461,17 +518,72 @@ class SummaryHandler:
       weighted_scalars: The WeightedScalars instance, keyed by strings and
         valued by 2-tuples (value, weight).
       summary_tensors: The summary values keyed by summary names.
+      per_example_out: A NestedMap of per example values.
       steps_per_sec: The estimate of steps per second to be added to the
         summary.
 
     Returns:
       True if the summaries were written, False otherwise.
     """
+    should_accumulate = self.should_accumulate(step)
+    should_write_summary = self.should_write(step)
+    should_log = self.should_log(step)
+    if should_log or should_accumulate or should_write_summary:
+      loss = py_utils.maybe_unreplicate_for_fully_replicated(loss)
+      weighted_scalars = py_utils.maybe_unreplicate_for_fully_replicated(
+          weighted_scalars)
+      summary_tensors = py_utils.maybe_unreplicate_for_fully_replicated(
+          summary_tensors)
+    if per_example_out and should_log:
+      per_example_out = py_utils.maybe_unreplicate_for_first_shard(
+          per_example_out)
+
+    if self._summary_pool:
+
+      def process_fn():
+        # Copy the values from device to host first.
+        loss_copy = jax.device_get(loss)
+        weighted_scalars_copy = jax.tree_util.tree_map(jax.device_get,
+                                                       weighted_scalars)
+        summary_tensors_copy = jax.tree_util.tree_map(jax.device_get,
+                                                      summary_tensors)
+        per_example_out_copy = None
+        if per_example_out and should_log:
+          per_example_out_copy = jax.tree_util.tree_map(jax.device_get,
+                                                        per_example_out)
+        self._process(step, loss_copy, weighted_scalars_copy,
+                      summary_tensors_copy, per_example_out_copy, steps_per_sec,
+                      should_log)
+
+      self._summary_pool.submit(process_fn)
+    else:
+      self._process(step, loss, weighted_scalars, summary_tensors,
+                    per_example_out, steps_per_sec, should_log)
+
+    return self.should_write(step)
+
+  def _process(self,
+               step: int,
+               loss: JTensor,
+               weighted_scalars: WeightedScalars,
+               summary_tensors: NestedJTensor,
+               per_example_out: Optional[NestedJTensor] = None,
+               steps_per_sec: Optional[float] = None,
+               should_log: bool = False) -> bool:
+    """Adds summaries for a given step."""
+
+    if should_log:
+      logging.info('step_i: %d, %s loss: %s', step, self._name, loss)
+      logging.info('weighted_scalars: %s', weighted_scalars)
+      if per_example_out:
+        logging.info('per_example_out: %s', per_example_out)
+      logging.info('summary_tensors: %s', summary_tensors)
+
     if self.should_accumulate(step):
       self._add(step, loss, weighted_scalars, summary_tensors, steps_per_sec)
 
     if not self.should_write(step):
-      return False
+      return
 
     # No accumulation. Add at least the latest value.
     if not self.accumulate_over_steps:
@@ -479,7 +591,6 @@ class SummaryHandler:
 
     self._write()
     self._clear()
-    return True
 
   def _add(self,
            step: int,

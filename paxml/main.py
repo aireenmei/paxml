@@ -26,11 +26,15 @@ import os
 import random
 import re
 import time
+import typing
 from typing import Dict, Optional, Sequence
 
 from absl import app
 from absl import flags
+from absl import logging
+# Required import to setup work units when running through XManager.
 from clu import platform
+from etils import epath
 import fiddle as fdl
 from fiddle import absl_flags
 import jax
@@ -40,17 +44,16 @@ from paxml import checkpoints
 from paxml import eval_lib
 from paxml import experiment_registry
 from paxml import setup_jax
+from paxml import tasks_lib
 from paxml import train
 from paxml import trainer_lib
 from paxml import tuning_lib
 from praxis import py_utils
 import pyglove as pg
-import tensorflow.compat.v2 as tf
 
+# internal experiment module import
 AsyncPersistenceCheckpointer = checkpoints.AsyncCheckpointer  # mapped to internal
 persistence_gda_serialization = gda_serialization  # mapped to internal
-
-# Required import to setup work units when running through XManager.
 
 FLAGS = flags.FLAGS
 
@@ -60,8 +63,11 @@ flags.DEFINE_string(
     'has a format like "<task>.<module>.<experiment>", which should have been '
     'already registered in the global experiment registry with '
     '@experiment_registry.register.')
-flags.DEFINE_string('job_log_dir', None,
-                    'Directory where all experiment assets will be stored.')
+epath.DEFINE_path(
+    'job_log_dir',
+    None,
+    'Directory where all experiment assets will be stored.',
+    required=True)
 flags.DEFINE_enum('mode', 'train',
                   ['train', 'eval', 'decode', 'decode_once', 'infer'],
                   'Flag to control which job is called.')
@@ -87,17 +93,29 @@ flags.DEFINE_bool(
     'Enables fully asynchronous checkpointing via GDA and TensorStore. This '
     'means that the training can continue ahead when checkpointing is '
     'happening.')
-flags.DEFINE_bool('use_orbax', False, 'Enables Orbax for checkpointing.')
+flags.DEFINE_bool(
+    'jax_array_in_pax', True,
+    'Use jax.Array globally in PAX which replaces DA, SDA and GDA.')
+flags.DEFINE_string(
+    'jax_traceback_filtering_option', 'auto',
+    'Controls how JAX filters internal frames out of tracebacks: '
+    'off, auto, tracebackhide, remove_frames. '
+    'See https://github.com/google/jax/blob/main/jax/_src/config.py')
+flags.DEFINE_bool(
+    'decode_output_pickle', True,
+    'Output the .pickle file alongside the .jsonl file when decoding, this '
+    'can take a lot of memory with large decodings so can be disabled here.')
+flags.DEFINE_bool('use_orbax', True, 'Enables Orbax for checkpointing.')
 flags.DEFINE_string(
     'checkpoint_todelete_subdir', None,
     'If set, checkpoints to be deleted will be only renamed into a '
     'subdirectory with the provided string. Otherwise, they will be directly '
     'deleted from the file system. Useful if checkpoint deletion is time '
     'consuming. By default, delete the checkpoint assets.')
-flags.DEFINE_string(
+epath.DEFINE_path(
     'restore_checkpoint_dir', None,
-    'If set, the directory from which to restore checkpoint. '
-    'Only supported when --mode=decode_once.')
+    'If set, the directory from which to restore checkpoint. Only supported '
+    'for --mode=decode_once and --mode=decode.')
 flags.DEFINE_integer(
     'restore_checkpoint_step', None,
     'If set, the checkpoint step to restore. Only supported when '
@@ -112,6 +130,9 @@ flags.DEFINE_integer(
 )
 flags.DEFINE_bool('enable_auto_sharding', False,
                   'Enable the XLA Auto SPMD partitioner.')
+flags.DEFINE_bool(
+    'enable_checkpoint_saving', True,
+    'Enable checkpoint saving. Useful to disable for test- or debug-like runs.')
 # Flags for automatic tuning.
 flags.DEFINE_string(
     'study', None,
@@ -140,7 +161,7 @@ flags.DEFINE_integer(
 # --jax_xla_backend, --jax_enable_checks are available through JAX.
 
 
-def _get_experiment(experiment_name: str) -> base_experiment.BaseExperimentT:
+def get_experiment(experiment_name: str) -> base_experiment.BaseExperimentT:
   """Retrieves an experiment config from the global registry."""
   experiment_class = experiment_registry.get(experiment_name)
   if experiment_class is not None:
@@ -148,7 +169,7 @@ def _get_experiment(experiment_name: str) -> base_experiment.BaseExperimentT:
   # Try to import the module that registers the experiment, assuming the
   # experiment name contains the full path.
   module_name = experiment_name.rsplit('.', 1)[0]
-  # internal experiment module import code
+  # Google-internal experiment module import code
   try:
     importlib.import_module(module_name)
   except ModuleNotFoundError as e:
@@ -169,31 +190,32 @@ def _default_early_stopping_fn(metrics: Dict[str, float],
                                step_i: int, unused_arg: bool) -> bool:
   """Dumping metrics into JSON file for debugging and other consumptions."""
   if jax.process_index() == 0:
-    metric_dir = os.path.join(FLAGS.job_log_dir, 'metrics')
-    if not tf.io.gfile.exists(metric_dir):
-      tf.io.gfile.makedirs(metric_dir)
-    if not tf.io.gfile.isdir(metric_dir):
+    metric_dir = FLAGS.job_log_dir / 'metrics'
+    metric_dir.mkdir(parents=True, exist_ok=True)
+    if not metric_dir.is_dir():
       raise ValueError(f'{metric_dir} should be a directory.')
-    metric_file_name = os.path.join(metric_dir, f'step-{step_i:06d}.json')
+    metric_file_name = metric_dir / f'step-{step_i:06d}.json'
+
     # Update and re-save the metrics.
     if (running_mode & trainer_lib.RunningMode.EVAL or
         running_mode & trainer_lib.RunningMode.DECODE):
-      if tf.io.gfile.exists(metric_file_name):
+      if metric_file_name.exists():
         # NOTE(daiyip): converting pg.Dict to dict which allows updates
         # with dot ('.') separated keys. (dot can be a part of dataset name)
-        existing_metrics = dict(pg.load(metric_file_name))
+        existing_metrics = dict(pg.load(str(metric_file_name)))
       else:
         existing_metrics = {}
       metrics.update(existing_metrics)
-      pg.save(metrics, metric_file_name)
+      pg.save(metrics, str(metric_file_name))
   return False
 
 
 def run_experiment(
     experiment_config: base_experiment.BaseExperiment,
     work_unit: platform.WorkUnit,
-    job_log_dir: str,
+    job_log_dir: epath.Path,
     early_stopping_fn: Optional[trainer_lib.EarlyStoppingFn] = None,
+    enable_checkpoint_saving: bool = True,
 ) -> None:
   """Run an experiment.
 
@@ -203,21 +225,33 @@ def run_experiment(
     job_log_dir: The directory for storing logs and writing checkpoints.
     early_stopping_fn: The early stopping function for training, evaluation
       and decoding. If None, the training will train to requested steps.
+    enable_checkpoint_saving: Whether to perform checkpoint saving or not.
   """
+  train.write_experiment_class_vars_file(
+      experiment_config.__class__, job_log_dir,
+      '' if FLAGS.mode == 'train' else f'{FLAGS.mode}_')
   train.write_hparams_file(experiment_config, job_log_dir,
                            '' if FLAGS.mode == 'train' else f'{FLAGS.mode}_')
+
+  task_p = experiment_config.task()
+  task_p = typing.cast(tasks_lib.SingleTask.HParams, task_p)
+  use_orbax = FLAGS.use_orbax or task_p.use_orbax
+  if use_orbax:
+    logging.info('Checkpointing with Orbax enabled.')
+
   if FLAGS.mode == 'train':
     work_unit.set_task_status(f'Train experiment {FLAGS.exp} at'
                               f' {job_log_dir}')
     async_checkpointer = None
     async_ckpt_manager = None
     if FLAGS.jax_fully_async_checkpoint:
-      if FLAGS.use_orbax:
+      if use_orbax:
         if FLAGS.maybe_use_persistence_checkpointing:
           async_checkpointer = AsyncPersistenceCheckpointer(timeout_secs=600)
         else:
           async_checkpointer = checkpoints.AsyncCheckpointer(
-              checkpoints.PaxCheckpointHandler(enable_flax=False))
+              checkpoints.PaxCheckpointHandler(enable_flax=False),
+              timeout_secs=600)
       else:
         if FLAGS.maybe_use_persistence_checkpointing:
           async_ckpt_manager = persistence_gda_serialization.GlobalAsyncCheckpointManager(
@@ -237,8 +271,14 @@ def run_experiment(
         async_ckpt_manager=async_ckpt_manager,
         run_decode=FLAGS.decode_during_train,
         enable_auto_sharding=FLAGS.enable_auto_sharding,
-        use_orbax=FLAGS.use_orbax,
-        async_checkpointer=async_checkpointer)
+        use_orbax=use_orbax,
+        async_checkpointer=async_checkpointer,
+        enable_checkpoint_saving=enable_checkpoint_saving)
+
+    if async_checkpointer is not None:
+      async_checkpointer.wait_until_finished()
+    if async_ckpt_manager is not None:
+      async_ckpt_manager.wait_until_finished()
   elif FLAGS.mode == 'eval':
     work_unit.set_task_status(f'Eval experiment {FLAGS.exp} at'
                               f' {job_log_dir}')
@@ -247,7 +287,9 @@ def run_experiment(
         job_log_dir=job_log_dir,
         maybe_use_persistence_checkpointing=FLAGS
         .maybe_use_persistence_checkpointing,
-        early_stopping_fn=early_stopping_fn)
+        early_stopping_fn=early_stopping_fn,
+        use_orbax=use_orbax,
+        enable_auto_sharding=FLAGS.enable_auto_sharding)
   elif FLAGS.mode == 'decode':
     work_unit.set_task_status(f'Decode experiment {FLAGS.exp} at'
                               f' {job_log_dir}')
@@ -256,11 +298,14 @@ def run_experiment(
         job_log_dir=job_log_dir,
         maybe_use_persistence_checkpointing=FLAGS
         .maybe_use_persistence_checkpointing,
-        restore_checkpoint_dir=None,
+        restore_checkpoint_dir=FLAGS.restore_checkpoint_dir,
         restore_checkpoint_step=None,
         continuous_decode=True,
         run_eval=FLAGS.eval_during_decode,
-        early_stopping_fn=early_stopping_fn)
+        early_stopping_fn=early_stopping_fn,
+        use_orbax=use_orbax,
+        enable_checkpoint_saving=enable_checkpoint_saving,
+        enable_auto_sharding=FLAGS.enable_auto_sharding)
   elif FLAGS.mode == 'decode_once':
     work_unit.set_task_status(f'Decode-once experiment {FLAGS.exp} at'
                               f' {job_log_dir}')
@@ -273,11 +318,17 @@ def run_experiment(
         restore_checkpoint_step=FLAGS.restore_checkpoint_step,
         continuous_decode=False,
         run_eval=FLAGS.eval_during_decode,
-        early_stopping_fn=early_stopping_fn)
+        early_stopping_fn=early_stopping_fn,
+        use_orbax=use_orbax,
+        enable_auto_sharding=FLAGS.enable_auto_sharding,
+        output_pickle=FLAGS.decode_output_pickle,
+        )
   elif FLAGS.mode == 'infer':
     work_unit.set_task_status(f'infer experiment {FLAGS.exp} at {job_log_dir}')
     eval_lib.infer_and_write(
-        experiment_config=experiment_config, job_log_dir=job_log_dir)
+        experiment_config=experiment_config,
+        job_log_dir=job_log_dir,
+        use_orbax=use_orbax)
 
   # Wait for all processes to exit at the same time because if some tasks
   # finish early and exited, when a preemption event comes, only a
@@ -286,7 +337,8 @@ def run_experiment(
   py_utils.sync_global_devices('All tasks finish.')
 
 
-def run(experiment_config: base_experiment.BaseExperiment):
+def run(experiment_config: base_experiment.BaseExperiment,
+        enable_checkpoint_saving: bool = True):
   """Run an experiment.
 
   This function exists to provide a clear injection seam for a given run.
@@ -296,6 +348,7 @@ def run(experiment_config: base_experiment.BaseExperiment):
 
   Args:
     experiment_config: The experiment to run.
+    enable_checkpoint_saving: Whether to perform checkpoint saving or not.
   """
 
   # Add a note so that we can tell which Borg task is which JAX host.
@@ -305,17 +358,18 @@ def run(experiment_config: base_experiment.BaseExperiment):
   work_unit = platform.work_unit()
   work_unit.set_task_status(f'process_index: {jax.process_index()}, '
                             f'process_count: {jax.process_count()}')
-  work_unit.create_artifact(platform.ArtifactType.DIRECTORY, FLAGS.job_log_dir,
-                            'job_log_dir')
+  work_unit.create_artifact(platform.ArtifactType.DIRECTORY,
+                            str(FLAGS.job_log_dir), 'job_log_dir')
 
   # Start jax.profiler for TensorBoard and profiling in open source.
   if FLAGS.jax_profiler_port is not None:
     server = jax.profiler.start_server(FLAGS.jax_profiler_port)  # pylint:disable=unused-variable
 
-  if (FLAGS.restore_checkpoint_dir or
-      FLAGS.restore_checkpoint_step) and FLAGS.mode != 'decode_once':
-    raise ValueError('--restore_checkpoint_dir and --restore_checkpoint_step '
-                     'only supported with --mode=decode_once.')
+  if ((FLAGS.restore_checkpoint_dir or FLAGS.restore_checkpoint_step) and
+      FLAGS.mode not in {'decode_once', 'decode'}):
+    raise ValueError(
+        '--restore_checkpoint_dir and --restore_checkpoint_step only supported '
+        'with --mode=decode_once or --mode=decode.')
 
   if FLAGS.study is None:
     # TODO(b/241666951): disable default_early_stopping_fn since this
@@ -324,8 +378,12 @@ def run(experiment_config: base_experiment.BaseExperiment):
         experiment_config,
         work_unit,
         job_log_dir=FLAGS.job_log_dir,
-        early_stopping_fn=None)
+        early_stopping_fn=None,
+        enable_checkpoint_saving=enable_checkpoint_saving)
   else:
+    if not enable_checkpoint_saving:
+      logging.warning(
+          'Ignoring flag `--enable_checkpoint_saving` for tuning experiment.')
     tuning_lib.tune(
         trial_fn=run_experiment,
         experiment_config=experiment_config,
@@ -343,17 +401,21 @@ def main(argv: Sequence[str]) -> None:
     raise app.UsageError('Too many command-line arguments.')
 
   setup_jax.setup_jax(FLAGS.globally_use_hardware_rng, FLAGS.jax_backend_target,
-                      FLAGS.jax_xla_backend, FLAGS.jax_enable_checks)
+                      FLAGS.jax_xla_backend, FLAGS.jax_enable_checks,
+                      FLAGS.jax_array_in_pax,
+                      FLAGS.jax_traceback_filtering_option,
+                      FLAGS.jax_fully_async_checkpoint)
 
   if FLAGS.exp is not None:
-    experiment_config = _get_experiment(FLAGS.exp)()
+    experiment_config = get_experiment(FLAGS.exp)()
   else:
     cfg = absl_flags.create_buildable_from_flags(
         module=None, allow_imports=True)
     experiment_config = fdl.build(cfg)
 
   experiment_config.validate()
-  run(experiment_config=experiment_config)
+  run(experiment_config=experiment_config,
+      enable_checkpoint_saving=FLAGS.enable_checkpoint_saving)
 
 
 _TASK_HANDLE_RE = re.compile(r'(?:logs\.)?(\d+)\.(.*)\.([^.]+)\.\d+')
@@ -371,5 +433,5 @@ if __name__ == '__main__':
   # Provide access to --jax_backend_target and --jax_xla_backend flags.
   jax.config.config_with_absl()
 
-  # TODO(shafey): Make `job_log_dir` mandatory?
+  flags.mark_flag_as_required('job_log_dir')
   app.run(main, flags_parser=absl_flags.flags_parser)

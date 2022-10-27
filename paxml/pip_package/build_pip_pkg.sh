@@ -40,7 +40,8 @@ function main() {
   # Create the directory, then do dirname on a non-existent file inside it to
   # give us an absolute paths with tilde characters resolved to the destination
   # directory.
-  mkdir -p "${DEST}"
+  [ ! -d $DEST ] && mkdir -p "${DEST}"
+  
   DEST=$(readlink -f "${DEST}")
   echo "=== destination directory: ${DEST}"
 
@@ -51,8 +52,9 @@ function main() {
   echo "=== Copy paxml files"
 
   cp ${PIP_FILE_PREFIX}setup.py "${TMPDIR}"
+  cp ${PIP_FILE_PREFIX}requirements.txt "${TMPDIR}"
   cp LICENSE "${TMPDIR}"
-  rsync -avm -L --exclude="*_test.py" paxml "${TMPDIR}"
+  rsync -avm -L paxml "${TMPDIR}"
   rsync -avm -L  --include="*.so" --include="*_pb2.py" \
     --exclude="*.runfiles" --exclude="*_obj" --include="*/" --exclude="*" \
     bazel-bin/paxml "${TMPDIR}"

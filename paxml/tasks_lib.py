@@ -18,25 +18,30 @@
 Note: The module name is suffixed with `_lib` to avoid the name conflict with
 the `tasks` Python submodule.
 """
+
 from __future__ import annotations
 
 import dataclasses
+import enum
 import itertools
 import re
+import typing
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 from absl import logging
+from etils import epath
 import jax
 from jax import numpy as jnp
+from jax.experimental import global_device_array
 from jax.experimental import maps
 from jax.experimental import pjit
 import numpy as np
 import optax
-from paxml import base_experiment
 from paxml import base_inference_runner
 from paxml import base_metrics
 from paxml import base_task
 from paxml import io_utils
+from praxis import asserts
 from praxis import base_hyperparams
 from praxis import base_input
 from praxis import base_layer
@@ -46,7 +51,6 @@ from praxis import optimizers
 from praxis import py_utils
 from praxis import pytypes
 from praxis import train_states
-import tensorflow.compat.v2 as tf
 
 from paxml import checkpoints  # mapped to internal
 
@@ -73,13 +77,15 @@ LOAD_ALL = ('(.*)', '{}')
 
 # TODO(pax-dev): Move this function when `pmap_use_tensorstore` flag is deleted.
 def restore_pmap_from_tensorstore(global_shapes,
-                                  checkpoint_dir,
+                                  checkpoint_dir: epath.PathLike,
                                   step=None,
-                                  global_mesh=None):
+                                  global_mesh=None,
+                                  checkpoint_type=CheckpointType.CHECKPOINT_GDA,
+                                  use_orbax=False):
   """Restores pmap checkpoints from tensorstore.
 
-  The model_states returned are of type `DeviceArray`. They are later converted
-  to SDA by calling `replicate_model_state` where this function is used.
+  The model_states returned are of type `DeviceArray`, `GlobalDeviceArray` or
+  `ShardedDeviceArray`.
 
   Args:
     global_shapes: Global shapes of the tensors to be restored.
@@ -89,29 +95,50 @@ def restore_pmap_from_tensorstore(global_shapes,
     global_mesh: If set, use this mesh to restore the checkpoint (meaning that
        the checkpoint is restored as part of an init_checkpoint_rules() call for
        a pjit model) and return a GDA. If unset, use a dummy mesh and return
-       a regular `DeviceArray` to be used with pmap.
+       a regular `DeviceArray` or `ShardedDeviceArray` to be used with pmap.
+    checkpoint_type: The type of checkpoint to use.
+    use_orbax: Enables checkpointing backed by Orbax.
 
   Returns:
-    Restored model states of type `DeviceArray` or `GlobalDeviceArray`.
+    Restored model states of type `DeviceArray`, `GlobalDeviceArray` or
+    ShardedDeviceArray`.
   """
   if global_mesh is None:
     restore_global_mesh = maps.Mesh(np.array(jax.devices()), axis_names=('x',))
   else:
     restore_global_mesh = global_mesh
-  fully_replicated_state_specs = jax.tree_map(
-      lambda x: pjit.PartitionSpec(None), global_shapes)
-  fully_replicated_gda_model_states = checkpoints.restore_checkpoint(
-      global_shapes,
-      checkpoint_dir,
-      global_mesh=restore_global_mesh,
-      checkpoint_type=CheckpointType.CHECKPOINT_GDA,
-      state_specs=fully_replicated_state_specs,
-      step=step)
+
+  def _get_spec(shape):
+    if shape.shape:
+      return pjit.PartitionSpec(None)
+    else:
+      return pjit.PartitionSpec()
+
+  fully_replicated_state_specs = jax.tree_map(_get_spec, global_shapes)
+  with restore_global_mesh:
+    fully_replicated_gda_model_states = checkpoints.restore_checkpoint(
+        global_shapes,
+        checkpoint_dir,
+        global_mesh=restore_global_mesh,
+        checkpoint_type=checkpoint_type,
+        state_specs=fully_replicated_state_specs,
+        step=step,
+        use_orbax=use_orbax)
   if global_mesh is not None:
     return fully_replicated_gda_model_states
-  # model_states is GDA; we convert back to DA for pmap.
-  model_states = jax.tree_map(lambda x: x.local_data(0),
-                              fully_replicated_gda_model_states)
+  if checkpoint_type == CheckpointType.CHECKPOINT_PERSISTENCE:
+    fully_replicated_sda_model_states = jax.tree_map(
+        py_utils.convert_fully_replicated_gda_to_sda,
+        fully_replicated_gda_model_states)
+    return fully_replicated_sda_model_states
+  # model_states is GDA or jax.Array; we convert back to DA or jax.Array with
+  # single device sharding for pmap.
+  if jax.config.jax_array:
+    model_states = jax.tree_map(lambda x: x.addressable_data(0),
+                                fully_replicated_gda_model_states)
+  else:
+    model_states = jax.tree_map(lambda x: x.addressable_data(0),
+                                fully_replicated_gda_model_states)
   return model_states
 
 
@@ -166,6 +193,12 @@ class CheckpointLoadingRules(NamedTuple):
       with name `source.format(*match_object.groups())` in the external
       checkpoint. In particular, the constant tuple LOAD_ALL is one rule that
       load everything as is.
+    safe_load: Boolean controlling safety checks on whether all load_rules
+      patterns are in fact used. Typos, or wrong variable names in the pattern
+      result on those variables being initialized randomly when the intent was
+      probably different. Turning safe_load = True checks that all patterns in
+      the set of load_rules were used for matching model parameters, trainable
+      or not. Warning: safe_load only applies to load_rules, not ignore_rules.
     ignore_rules: If the variable name matches with one of the regexs in the
       list, the checkpoint variables are not used even if the name matches with
       `load_rules`.
@@ -179,6 +212,7 @@ class CheckpointLoadingRules(NamedTuple):
   """
   task_p: SingleTask.HParams
   load_rules: Sequence[Tuple[RegexStr, str]]
+  safe_load: bool = False
   ignore_rules: Optional[Sequence[RegexStr]] = None
   step: Optional[int] = None
   load_step: bool = False
@@ -238,6 +272,9 @@ class SingleTask(base_task.BaseTask):
       save_max_to_keep: The maximum number of recent checkpoints to keep.
       summary_interval_steps: How frequently to generate summaries in terms of
         the number of training steps.
+      device_sync_interval_steps: How many train steps to dispatch before
+        explicit device sync. If set, log loss and write summaries in a separate
+        thread.
       log_train_output_interval_steps:  How frequently to log training output to
         the INFO stream. If set to None, use the same value as for
         `summary_interval_steps`.
@@ -264,6 +301,18 @@ class SingleTask(base_task.BaseTask):
       decode_interval_steps: How frequently to run decode on the model on the
         decoder_datasets() in terms of the number of training steps. Skipped if
         this value is not a positive int. Set to 0 to disable decode steps.
+      decode_start_after_n_steps: Starts decoder after N steps, only used in
+        continuous decoding.
+      profiler_num_steps: The number of steps to be captured by the profiler
+        based on the step time estimate.
+      profiler_min_duration_sec: The minimum duration to be captured by the
+        profiler in seconds. This is used when the estimate step duration times
+        profiler_num_steps is smaller than this value.
+      profiler_capture_step: The step index at which to capture a code profile.
+        No trace is captured if set to None.
+      always_use_train_for_model_init: Boolean indicating whether to use the new
+        flow for model initialization. With this new flow, dedicated evaluation
+        and decoding-only jobs rely on training inputs for model initialization.
     """
     learner: learners_lib.Learner.HParams = sub_config_field(
         learners_lib.Learner.HParams)
@@ -272,6 +321,7 @@ class SingleTask(base_task.BaseTask):
     save_keep_interval_duration: str = '12h'
     save_max_to_keep: int = 10
     summary_interval_steps: int = 100
+    device_sync_interval_steps: Optional[int] = None
     log_train_output_interval_steps: Optional[int] = None
     summary_accumulate_interval_steps: Optional[int] = None
     variable_norm_summary: bool = True
@@ -281,6 +331,17 @@ class SingleTask(base_task.BaseTask):
     init_from_checkpoint_rules: Dict[
         str, CheckpointLoadingRules] = dataclasses.field(default_factory=dict)
     decode_interval_steps: Optional[int] = None
+    decode_start_after_n_steps: int = 0
+    profiler_num_steps: int = 2
+    profiler_min_duration_sec: float = 1.
+    profiler_capture_step: Optional[int] = None
+    always_use_train_for_model_init: bool = False
+
+  @enum.unique
+  class TrackDecoderMetricMode(str, enum.Enum):
+    """Two different modes for tracking a metric: min or max."""
+    MAX = 'max'
+    MIN = 'min'
 
   class HParams(base_task.BaseTask.HParams):
     """Task parameters.
@@ -295,7 +356,9 @@ class SingleTask(base_task.BaseTask):
         losses are aggregated (e.g single or MultiLoss)
       vn: HParams to control variational noise.
       track_decoder_metric: which decoding metric to track, e.g. 'wer'.
+      track_decoder_metric_min_or_max: track min or max metric value.
       infer_writer: specifies how to generate and write some output with a model
+      use_orbax: if True, enables checkpointing with Orbax.
     """
     model: Optional[base_model.BaseModel.HParams] = None
 
@@ -309,7 +372,10 @@ class SingleTask(base_task.BaseTask):
     vn: SingleTask.VariationalNoiseHParams = sub_config_field(
         lazy_ref=lambda: SingleTask.VariationalNoiseHParams)
     track_decoder_metric: Optional[str] = None
+    track_decoder_metric_min_or_max: Optional[
+        SingleTask.TrackDecoderMetricMode] = None
     infer_writer: Optional[SingleTask.InferWriterHParams] = None
+    use_orbax: bool = False
 
   def __init__(self, hparams: SingleTask.HParams) -> None:
     super().__init__(hparams)
@@ -396,7 +462,7 @@ class SingleTask(base_task.BaseTask):
       A list of NestedJTensor to update `opt_states` in TrainState.
     """
     grad_txs = [x.get_grad_tx(var_weight_hparams) for x in self.learners]
-    tf.nest.assert_same_structure(mdl_vars, var_weight_hparams)
+    asserts.assert_same_structure(mdl_vars, var_weight_hparams)
     return [x.init(mdl_vars) for x in grad_txs]
 
   def create_train_state(self,
@@ -419,8 +485,8 @@ class SingleTask(base_task.BaseTask):
     """
     # Make a private copy of mdl_vars and var_weight_hparams structures that are
     # not shared with the caller.
-    mdl_vars = tf.nest.map_structure(lambda x: x, mdl_vars)
-    var_weight_hparams = tf.nest.map_structure(lambda x: x, var_weight_hparams)
+    mdl_vars = jax.tree_util.tree_map(lambda x: x, mdl_vars)
+    var_weight_hparams = jax.tree_util.tree_map(lambda x: x, var_weight_hparams)
     if discard_opt_states:
       opt_states = {}
     else:
@@ -457,7 +523,7 @@ class SingleTask(base_task.BaseTask):
 
     model_state_partition_specs = self.create_train_state_partition_specs(
         var_weight_hparams, discard_opt_states)
-    tf.nest.assert_same_structure(model_state_partition_specs, unpadded_shapes)
+    asserts.assert_same_structure(model_state_partition_specs, unpadded_shapes)
 
     def _maybe_pad(shape_dtype, pspec):
       if py_utils.is_optax_masked_node(shape_dtype):
@@ -639,82 +705,70 @@ class SingleTask(base_task.BaseTask):
       rules: CheckpointLoadingRules,
       load_status: List[Any],
       global_mesh: Optional[maps.Mesh] = None,
-      checkpoint_type: CheckpointType = CheckpointType.CHECKPOINT_FLAX):
+      checkpoint_type: CheckpointType = CheckpointType.CHECKPOINT_FLAX,
+      target_partition_specs: Optional[TrainState] = None):
     """Applies one CheckpointLoadingRules to train_state."""
-    ckpt_task = instantiate(rules.task_p)
+    uses_gda = (
+        checkpoint_type == CheckpointType.CHECKPOINT_GDA or
+        checkpoint_type == CheckpointType.CHECKPOINT_PERSISTENCE)
+    if uses_gda:
+      rules.task_p.model.ici_mesh_shape = self.model.hparams.ici_mesh_shape
+      rules.task_p.model.dcn_mesh_shape = self.model.hparams.dcn_mesh_shape
+      rules.task_p.model.mesh_axis_names = self.model.hparams.mesh_axis_names
+    ckpt_task = typing.cast(SingleTask, instantiate(rules.task_p))
     is_step_loaded, is_initialized, is_opt_states_loaded = load_status
     model_vars = train_state.mdl_vars
 
     input_specs_provider_p = rules.input_specs_provider_p
     input_specs_provider = instantiate(input_specs_provider_p)
     inputs_shape_dtype = input_specs_provider.get_input_specs()
+    # TODO(pax-dev): Add better/cleaner API to identify pmap vs. pjit models
+    # (and check for dcn_mesh_shape too).
+    if (hasattr(ckpt_task.model, 'ici_mesh_shape') and
+        ckpt_task.model.ici_mesh_shape is not None):
+      inputs_shape_dtype = jax.tree_map(py_utils.get_global_input_shape_dtype,
+                                        inputs_shape_dtype)
     # Initialize with a dummy seed
-    vars_weight_params = ckpt_task.model.abstract_init_with_metadata(
-        jax.random.PRNGKey(0), inputs_shape_dtype)
+    var_weight_hparams = ckpt_task.model.abstract_init_with_metadata(
+        inputs_shape_dtype)
     ckpt_train_state = ckpt_task.create_train_state_padded_shapes(
-        vars_weight_params)
+        var_weight_hparams)
     train_state_pspecs = ckpt_task.create_train_state_partition_specs(
-        vars_weight_params)
+        var_weight_hparams)
+
+    if target_partition_specs is not None:
+      flat_mdl_vars_pspecs = dict(
+          NestedMap(target_partition_specs.mdl_vars).FlattenItems())
+    else:
+      flat_mdl_vars_pspecs = None
+
+    def _get_var_pspec(varname):
+      if flat_mdl_vars_pspecs is None:
+        return None
+      return flat_mdl_vars_pspecs[varname]
 
     load_ema_state = (
         hasattr(rules.task_p, 'train') and
         rules.task_p.train.learner.optimizer.ema_decay > 0.0)
-
-    # For GDA checkpoint type, skip loading step / opt states from the
-    # checkpoint if rules are set to False. FLAX checkpoint type doesn't support
-    # loading and assigning partial saved vars.
-    if checkpoint_type == CheckpointType.CHECKPOINT_GDA:
-      if not rules.load_step:
-        ckpt_train_state = ckpt_train_state.replace(step={})
-        if train_state_pspecs is not None:
-          train_state_pspecs = train_state_pspecs.replace(step={})
-      if not rules.load_opt_states and not load_ema_state:
-        ckpt_train_state = ckpt_train_state.replace(opt_states={})
-        if train_state_pspecs is not None:
-          train_state_pspecs = train_state_pspecs.replace(opt_states={})
-
-    if py_utils.pmap_use_tensorstore():
-      assert checkpoint_type == CheckpointType.CHECKPOINT_GDA
-      loaded_train_state = restore_pmap_from_tensorstore(
-          ckpt_train_state, ckpt_path, step=rules.step, global_mesh=global_mesh)
-    else:
-      loaded_train_state = checkpoints.restore_checkpoint(
-          ckpt_train_state,
-          ckpt_path,
-          global_mesh=global_mesh,
-          checkpoint_type=checkpoint_type,
-          state_specs=train_state_pspecs,
-          step=rules.step)
-    if loaded_train_state is None:
-      raise RuntimeError(f'Cannot find checkpoint from {ckpt_path}')
-
-    # Use NestedMap's utility accessors
-    loaded_vars = dict(
-        NestedMap.FromNestedDict(loaded_train_state.mdl_vars).FlattenItems())
-
-    # Load EMA state if specified
-    if load_ema_state:
-      for v in loaded_train_state.opt_states[0]:
-        if 'ema' in v:
-          loaded_vars.update(
-              NestedMap.FromNestedDict({
-                  'ema': v.ema
-              }).FlattenItems())
-    else:
-      # Check if rules use ema state
-      for _, ref in rules.load_rules:
-        if ref.startswith('ema/'):
-          raise RuntimeError('Load ema state but ema is not enabled for ckpt')
 
     loading_rules = [
         (re.compile(pattern), ref) for pattern, ref in rules.load_rules
     ]
     ignore_rules = rules.ignore_rules if rules.ignore_rules is not None else []
     ignore_rules = [re.compile(pattern) for pattern in ignore_rules]
+    # pspecs for the init checkpoint, inferred from model_vars.
+    matched_pspecs = {}
+    # Mapping from names in model_vars to names in the init checkpoint.
+    model_vars_mapping = {}
+    if rules.safe_load:
+      all_dest_patterns_in_loading_rules = set()
+      matched_dest_patterns_in_loading_rules = set()
     for varname, unused_val in model_vars.FlattenItems():
       varname_orig = varname
       varname = varname.replace('.', '/')  # dot is reserved for regex
       for pattern, refname in loading_rules:
+        if rules.safe_load:
+          all_dest_patterns_in_loading_rules.add(pattern.pattern)
         mo = pattern.match(varname)
         if mo is None:
           logging.info(
@@ -734,13 +788,148 @@ class SingleTask(base_task.BaseTask):
           continue
         refname = refname.format(*mo.groups())
         refname = refname.replace('/', '.')
+        if rules.safe_load:
+          matched_dest_patterns_in_loading_rules.add(pattern.pattern)
 
         # Only for logging, keep name of ckpt that initialized the variable
         is_initialized[varname] = ckpt_path + '/' + refname
         logging.info(
             'Initialization by external checkpoint: '
             '%s is overwritten by %s in %s', varname, refname, ckpt_path)
-        model_vars.Set(varname_orig, loaded_vars[refname])
+        pspec = _get_var_pspec(varname_orig)
+        if refname in matched_pspecs:
+          if matched_pspecs[refname] != pspec:
+            raise ValueError('Not supported: multiple vars initialized from '
+                             'the same init checkpoint variable but have '
+                             f'different pspecs. {matched_pspecs[refname]} vs '
+                             f'{pspec} in {varname}')
+        else:
+          matched_pspecs[refname] = pspec
+        model_vars_mapping[varname_orig] = refname
+
+    if rules.safe_load:
+      # Check that all source names have been matched; if they have not then the
+      # loading rules do not serve the intended purpose.
+      diff = all_dest_patterns_in_loading_rules.difference(
+          matched_dest_patterns_in_loading_rules)
+      if diff:
+        logging.info('Difference all-matched load_rule patterns=%r', diff)
+        raise ValueError(f'The checkpoint loading rule(s) {rules.load_rules} '
+                         'do not serve the intended purpose; some model '
+                         'variables that were meant to be loaded from '
+                         'checkpoint are left to their initial (random) values '
+                         f'due to wrong pattern(s): {diff}.')
+
+    # For GDA checkpoint type, skip loading step / opt states from the
+    # checkpoint if rules are set to False. FLAX checkpoint type doesn't support
+    # loading and assigning partial saved vars.
+    if uses_gda:
+      if not rules.load_step:
+        ckpt_train_state = ckpt_train_state.replace(step={})
+        if train_state_pspecs is not None:
+          train_state_pspecs = train_state_pspecs.replace(step={})
+      if not rules.load_opt_states and not load_ema_state:
+        ckpt_train_state = ckpt_train_state.replace(opt_states={})
+        if train_state_pspecs is not None:
+          train_state_pspecs = train_state_pspecs.replace(opt_states={})
+
+      def _filter_vars_and_get_pspecs(variables):
+        filtered_vars = []
+        pspecs = []
+        for k, v in variables.FlattenItems():
+          if k in matched_pspecs:
+            filtered_vars.append(v)
+            pspecs.append(matched_pspecs[k])
+          else:
+            filtered_vars.append(())
+            pspecs.append(())
+        return variables.Pack(filtered_vars), variables.Pack(pspecs)
+
+      filtered_vars, pspecs = _filter_vars_and_get_pspecs(
+          NestedMap(ckpt_train_state.mdl_vars))
+      ckpt_train_state = ckpt_train_state.replace(mdl_vars=filtered_vars)
+      if train_state_pspecs is not None:
+        train_state_pspecs = train_state_pspecs.replace(mdl_vars=pspecs)
+      if load_ema_state:
+        new_states = []
+        new_states_pspecs = []
+        # TODO(pax-dev): This doesn't work with prefix dims.
+        for i, v in enumerate(ckpt_train_state.opt_states[0]):
+          if 'ema' not in v:
+            new_states.append(v)
+            if train_state_pspecs is not None:
+              new_states_pspecs.append(train_state_pspecs.opt_states[0][i])
+          else:
+            v = NestedMap.FromNestedDict(v)
+            filtered_ema, ema_pspecs = _filter_vars_and_get_pspecs(v.ema)
+            v.ema = filtered_ema
+            new_states.append(v)
+            if train_state_pspecs is not None:
+              v_pspecs = NestedMap.FromNestedDict(
+                  train_state_pspecs.opt_states[0][i])
+              v_pspecs.ema = ema_pspecs
+              new_states_pspecs.append(v_pspecs)
+        tuple_type = type(ckpt_train_state.opt_states[0])
+        outer_tuple_type = type(ckpt_train_state.opt_states)
+        new_states0 = outer_tuple_type([tuple_type(new_states)])
+        ckpt_train_state.replace(opt_states=new_states0 +
+                                 ckpt_train_state.opt_states[1:])
+        if train_state_pspecs is not None:
+          new_states_pspecs0 = outer_tuple_type([tuple_type(new_states_pspecs)])
+          train_state_pspecs.replace(opt_states=new_states_pspecs0 +
+                                     train_state_pspecs.opt_states[1:])
+
+    if (py_utils.pmap_use_tensorstore() and
+        ckpt_task.model.hparams.ici_mesh_shape is None):
+      assert (checkpoint_type in {
+          CheckpointType.CHECKPOINT_GDA, CheckpointType.CHECKPOINT_PERSISTENCE
+      })
+      loaded_train_state = restore_pmap_from_tensorstore(
+          ckpt_train_state,
+          ckpt_path,
+          step=rules.step,
+          global_mesh=global_mesh,
+          checkpoint_type=checkpoint_type)
+    else:
+      loaded_train_state = checkpoints.restore_checkpoint(
+          ckpt_train_state,
+          checkpoint_dir=ckpt_path,
+          global_mesh=global_mesh,
+          checkpoint_type=checkpoint_type,
+          state_specs=train_state_pspecs,
+          step=rules.step)
+
+    if loaded_train_state is None:
+      raise RuntimeError(f'Cannot find checkpoint from {ckpt_path}')
+    # Use NestedMap's utility accessors
+    loaded_vars = dict(NestedMap(loaded_train_state.mdl_vars).FlattenItems())
+
+    # Load EMA state if specified
+    if load_ema_state:
+      # TODO(pax-dev): This doesn't work with prefix dims.
+      for v in loaded_train_state.opt_states[0]:
+        if 'ema' in v:
+          loaded_vars.update(
+              NestedMap.FromNestedDict({
+                  'ema': v.ema
+              }).FlattenItems())
+    else:
+      # Check if rules use ema state
+      for _, ref in rules.load_rules:
+        if ref.startswith('ema/'):
+          raise RuntimeError('Load ema state but ema is not enabled for ckpt')
+
+    used_vars = set()
+    for var_name, init_var_name in model_vars_mapping.items():
+      loaded_var = loaded_vars[init_var_name]
+      if init_var_name not in used_vars:
+        used_vars.add(init_var_name)
+      # Copy the var if it's used more than once.
+      elif isinstance(loaded_var, global_device_array.GlobalDeviceArray):
+        loaded_var = py_utils.copy_gda(loaded_var)
+      else:
+        loaded_var = jnp.copy(loaded_var)
+      model_vars.Set(var_name, loaded_var)
     train_state = train_state.replace(mdl_vars=model_vars)
 
     if rules.load_step:
@@ -772,6 +961,7 @@ class SingleTask(base_task.BaseTask):
   def apply_init_checkpoint_rules(
       self,
       train_state: TrainState,
+      train_state_partition_specs: Optional[TrainState] = None,
       global_mesh: Optional[maps.Mesh] = None,
       checkpoint_type: CheckpointType = CheckpointType.CHECKPOINT_FLAX,
   ) -> Tuple[TrainState, bool]:
@@ -779,6 +969,8 @@ class SingleTask(base_task.BaseTask):
 
     Args:
       train_state: initialized train_state.
+      train_state_partition_specs: The TrainState specs for initialized
+        train_state. Required for GDA-based checkpoints.
       global_mesh: optional mesh used to restore checkpoint if needed.
       checkpoint_type: used to restore checkpoint.
 
@@ -798,10 +990,14 @@ class SingleTask(base_task.BaseTask):
     is_opt_states_loaded = None  # record which checkpoint loaded opt_states
     load_status = [is_step_loaded, is_initialized, is_opt_states_loaded]
     for ckpt_path, rules in all_rules.items():
-      train_state = self._apply_init_checkpoint_rule(train_state, ckpt_path,
-                                                     rules, load_status,
-                                                     global_mesh,
-                                                     checkpoint_type)
+      train_state = self._apply_init_checkpoint_rule(
+          train_state,
+          ckpt_path,
+          rules,
+          load_status,
+          global_mesh,
+          checkpoint_type,
+          target_partition_specs=train_state_partition_specs)
 
     # Convert mdl_vars back to Python dict for compatibility.
     train_state = train_state.replace(

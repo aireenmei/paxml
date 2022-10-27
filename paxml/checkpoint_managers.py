@@ -20,7 +20,7 @@ import datetime
 import itertools
 import os
 import typing
-from typing import Optional, Sequence
+from typing import Any, Optional, List, Union, Mapping
 
 from absl import logging
 from etils import epath
@@ -32,11 +32,14 @@ from paxml import checkpoints
 from praxis import py_utils
 import tensorflow.compat.v2 as tf
 
+from google.protobuf import message
+
 CheckpointType = checkpoint_pb2.CheckpointType
 
 CHECKPOINT_PREFIX = 'checkpoint_'
 CHECKPOINT_BASENAME = 'checkpoints.pb'
-TRAIN_STATE_KEY = 'train_state'
+DEFAULT_ITEM_NAME = orbax.checkpoint.checkpoint_manager.DEFAULT_ITEM_NAME
+METRIC_ITEM_NAME = orbax.checkpoint.checkpoint_manager.METRIC_ITEM_NAME
 
 
 def to_timestamp(datetime_instance: datetime.datetime) -> int:
@@ -93,7 +96,7 @@ class CheckpointManager:
   def __init__(self,
                *,
                config_name: str,
-               root_dir: str,
+               root_dir: epath.PathLike,
                checkpoint_type: CheckpointType,
                save_interval_steps=int,
                max_to_keep: Optional[int],
@@ -134,7 +137,7 @@ class CheckpointManager:
         time consuming. By default, delete the checkpoint assets.
     """
     self._config_name: str = config_name
-    self._root_dir: str = root_dir
+    self._root_dir: epath.Path = epath.Path(root_dir)
     self._checkpoint_type: CheckpointType = checkpoint_type
 
     self._save_interval_steps: int = save_interval_steps
@@ -147,9 +150,9 @@ class CheckpointManager:
     self._init_checkpoint_history()
 
   @property
-  def checkpoint_filename(self) -> str:
+  def checkpoint_filename(self) -> epath.Path:
     """Full checkpoints' filename."""
-    return os.path.join(self._root_dir, self._checkpoint_basename)
+    return self._root_dir / self._checkpoint_basename
 
   @property
   def last_checkpoint_step(self) -> int:
@@ -213,7 +216,7 @@ class CheckpointManager:
     """Creates a CheckpointHistory instance with default fields set."""
     return checkpoint_pb2.CheckpointHistory(
         config_name=self._config_name,
-        root_directory=self._root_dir,
+        root_directory=str(self._root_dir),
         checkpoint_type=self._checkpoint_type)
 
   def _init_checkpoint_history(self) -> None:
@@ -226,7 +229,21 @@ class CheckpointManager:
       return
 
     # Read the previous checkpoints file and performs a sanity check.
-    self._checkpoint_history = self._read_checkpoint_file()
+    try:
+      self._checkpoint_history = self._read_checkpoint_file()
+    except (message.DecodeError, tf.errors.NotFoundError):
+      logging.error(
+          'Checkpoints file `%s` is corrupted. Initializing a new file.',
+          self.checkpoint_filename)
+      self._checkpoint_history = self._create_checkpoint_history()
+      return
+    else:
+      if not self._checkpoint_history.checkpoints:
+        logging.warning(
+            'Checkpoints file `%s` is empty. Initializing a new file.',
+            self.checkpoint_filename)
+        self._checkpoint_history = self._create_checkpoint_history()
+        return
 
     last_saved_timestamp = (
         self._checkpoint_history.checkpoints[-1].timestamp_sec)
@@ -281,22 +298,23 @@ class CheckpointManager:
 
     self._save_checkpoint_file(latest_global_step)
 
-  def _delete_pattern_if_exists(self, root_dir: str, filepath: str) -> None:
+  def _delete_pattern_if_exists(self, root_dir: epath.Path,
+                                filepath: str) -> None:
     """Deletes everything under `filepath`."""
     # Note: This method may be called by different JAX processes. The
     # concurrency logic is handled in _delete_checkpoint() below.
-    src = os.path.join(root_dir, filepath)
+    root_dir = epath.Path(root_dir)
+    src = root_dir / filepath
     logging.info('Deleting files with filepath: `%s`', src)
-    if tf.io.gfile.exists(src):
+    if src.exists():
       if self._todelete_subdir:
-        rename_dir = os.path.join(root_dir, self._todelete_subdir)
-        if not tf.io.gfile.exists(rename_dir):
-          tf.io.gfile.mkdir(rename_dir)
-        dst = os.path.join(rename_dir, filepath)
+        rename_dir = root_dir / self._todelete_subdir
+        rename_dir.mkdir(parents=True, exist_ok=True)
+        dst = rename_dir / filepath
         # TODO(pax-team): Check if dst already exists?
-        tf.io.gfile.rename(src, dst)
+        src.rename(dst)
       else:
-        tf.io.gfile.rmtree(src)
+        src.rmtree()
 
   def _delete_checkpoint(self,
                          checkpoint: checkpoint_pb2.CheckpointMetadata) -> None:
@@ -411,37 +429,103 @@ class OrbaxCheckpointManager(orbax.checkpoint.CheckpointManager):
   All public APIs may be called by all processes.
   """
 
-  def all_steps(self) -> Sequence[int]:
-    """See superclass documentation."""
+  def __init__(
+      self,
+      *args,
+      checkpoint_type: CheckpointType = CheckpointType.CHECKPOINT_UNSPECIFIED,
+      **kwargs):
+    if checkpoint_type == CheckpointType.CHECKPOINT_UNSPECIFIED:
+      raise ValueError('Must specify checkpoint type.')
+    self._checkpoint_type = checkpoint_type
+    super().__init__(*args, **kwargs)
+
+  def _checkpoint_name(self, step: Union[int, str]) -> str:
+    if self._checkpoint_type == CheckpointType.CHECKPOINT_FLAX:
+      return f'{CHECKPOINT_PREFIX}{step}'
+    else:
+      return checkpoints.checkpoint_name(step)
+
+  def _create_checkpoints(
+      self) -> List[orbax.checkpoint.checkpoint_manager.CheckpointInfo]:
+    """Create a list of CheckpointInfo for existing checkpoints.
+
+    If none are present, returns empty list.
+
+    This method is copied from the superclass, except for the logic reading
+    existing checkpoint steps.
+
+    Returns:
+      a list of CheckpointInfo, sorted by increasing step.
+    """
     checkpoint_dirnames = tf.io.gfile.listdir(self.directory)
     dirnames = [
         x for x in checkpoint_dirnames if checkpoints.is_checkpoint_asset(x)
     ]
-    steps = [
+    steps = sorted([
         int(os.path.basename(x).replace(checkpoints.CHECKPOINT_PREFIX, ''))
         for x in dirnames
+    ])
+    if not steps:
+      return []
+
+    times = [
+        datetime.datetime.fromtimestamp(
+            (self.directory / self._checkpoint_name(step)).stat().mtime)
+        for step in steps
     ]
-    return steps
+
+    def get_metrics(step):
+      if self._track_best:
+        restored = self._restore_impl(step, {METRIC_ITEM_NAME: None}, {})
+        if METRIC_ITEM_NAME in restored:
+          return restored[METRIC_ITEM_NAME]
+      return None
+
+    metrics = [get_metrics(step) for step in steps]
+
+    return [
+        orbax.checkpoint.checkpoint_manager.CheckpointInfo(
+            step=s, time=t, metrics=m)
+        for s, t, m in zip(steps, times, metrics)
+    ]
 
   def _get_save_directory(self,
                           step: int,
                           directory: epath.Path,
                           key_name: Optional[str] = None) -> epath.Path:
     """Returns the standardized path to a save directory for a single item."""
-    if key_name is None or key_name == TRAIN_STATE_KEY:
-      return epath.Path(
-          checkpoints._make_checkpoint_step_dir(os.fspath(directory), step))  # pylint: disable=protected-access
+    if key_name is None or key_name == DEFAULT_ITEM_NAME:
+      if self._checkpoint_type == CheckpointType.CHECKPOINT_FLAX:
+        return directory
+      else:
+        return checkpoints._make_checkpoint_step_dir(directory, step)  # pylint: disable=protected-access
     else:
       raise ValueError(
           f'Unrecognized item {key_name} is not currently supported.')
+
+  def _cleanup_tmp_directories(self):
+    if self._checkpoint_type == CheckpointType.CHECKPOINT_FLAX:
+      if jax.process_index() == 0:
+        tmp_files = self.directory.glob(self._checkpoint_name('tmp'))
+        for tmp_file in tmp_files:
+          if tmp_file.is_file():
+            tmp_file.unlink()
+          else:
+            msg = ('Unrecognized directory matching tmp file pattern. Skipping '
+                   'deletion.')
+            logging.warning(msg)
+      multihost_utils.sync_global_devices('cleanup_tmp_dirs')
+    else:
+      super()._cleanup_tmp_directories()
 
   def _delete_directory(self, step: int):
     if jax.process_index() != 0:
       return
     options = typing.cast(CheckpointManagerOptions, self._options)
     todelete_subdir = options.todelete_subdir
+    checkpoint_name = self._checkpoint_name(step)
+
     if todelete_subdir:
-      checkpoint_name = checkpoints.checkpoint_name(step)
       rename_dir = self.directory / todelete_subdir
       if not rename_dir.exists():
         rename_dir.mkdir(parents=True)
@@ -450,4 +534,15 @@ class OrbaxCheckpointManager(orbax.checkpoint.CheckpointManager):
       # TODO(pax-team): Check if dst already exists?
       tf.io.gfile.rename(src, dst)
     else:
-      super()._delete_directory(step)
+      if self._checkpoint_type == CheckpointType.CHECKPOINT_FLAX and jax.process_index(
+      ) == 0:
+        delete_path = self.directory / checkpoint_name
+        assert delete_path.is_file()
+        delete_path.unlink()
+      else:
+        super()._delete_directory(step)
+
+  def structure(self) -> Union[Any, Mapping[str, Any]]:
+    if self._checkpoint_type == CheckpointType.CHECKPOINT_FLAX:
+      raise ValueError('`structure` not supported for Flax format checkpoints.')
+    return super().structure()

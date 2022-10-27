@@ -10,8 +10,7 @@ RUN pip3 install -U --no-deps -r /paxml/praxis/pip_package/requirements.txt
 RUN pip3 install -U --no-deps -r /paxml/paxml/pip_package/requirements.txt
 RUN cd /paxml && bazel build ...
 
-# RUN cd /paxml && bazel test paxml/... --test_output=all --test_verbose_timeout_warnings
-RUN cd /paxml && bazel test paxml:tasks_lib_test --test_output=all --test_verbose_timeout_warnings
+RUN cd /paxml && bazel test paxml/... --test_output=all --test_verbose_timeout_warnings
 WORKDIR /
 
 CMD ["/bin/bash"]

@@ -16,8 +16,10 @@
 """AutoML utility library for PAX."""
 
 import abc
+import collections
 import inspect
-from typing import Any, Dict, Optional, Sequence, Type, Union
+import math
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Type, Union
 from paxml import automl_interfaces
 # Placeholder for importing Google-internal tuning modules.
 from praxis import base_hyperparams
@@ -28,29 +30,71 @@ BaseParameterizable = base_hyperparams.BaseParameterizable
 InstantiableHyperParams = base_hyperparams.InstantiableHyperParams
 
 BaseAlgorithm = automl_interfaces.BaseAlgorithm
+BaseEarlyStoppingPolicy = automl_interfaces.BaseEarlyStoppingPolicy
 BaseReward = automl_interfaces.BaseReward
+CrossStepMetricAggregator = automl_interfaces.CrossStepMetricAggregator
 SearchHParams = automl_interfaces.SearchHParams
 MetricType = automl_interfaces.MetricType
 Metric = automl_interfaces.Metric
+MetricAggregator = automl_interfaces.MetricAggregator
 
 
 # Aliases for Google-internal symbols.
 
+
+# An AutoML experiment can have multiple sub-experiments enabled by
+# `SubExperimentFactory`, which transforms an experiment config into
+# a dictionary of sub-experiment id (str) to their configs.
+# Since Vizier does not natively support merging metrics at a given step,
+# we need to report metrics from sub-experiments at non-overlapping steps.
+# To do so, we add a reporting step offset for each sub-experiment, and use
+# this constant to compute the step space. This essentially means:
+#
+# When there are 3 sub-experiments in a tuning experiment:
+#   the 1st sub-experiment starts its step 0 at step 0;
+#   the 2nd sub-experiment starts its step 0 at step 1000_000_000;
+#   the 3rd sub-experiment starts its step 0 at step 2000_000_000.
+SUB_EXPERIMENT_STEP_OFFSET = 1000_000_000
 
 #
 # Common search hyperparameters.
 #
 
 
-def hyperparameter_tuning(metric: Metric,
-                          max_num_trials: int = 100,
-                          goal: str = 'maximize') -> SearchHParams:
+def hyperparameter_tuning(
+    metric: Metric,
+    max_num_trials: int = 100,
+    goal: str = 'maximize',
+    *,
+    errors_to_skip: Optional[List[
+        Union[Type[Exception], Tuple[Type[Exception], str]]]] = None,
+    cross_step_metric_aggregator: Optional[
+        CrossStepMetricAggregator.HParams] = None,
+    early_stopping: Optional[
+        BaseEarlyStoppingPolicy.HParams] = None,
+    reward_for_nan: Optional[float] = None) -> SearchHParams:
   """Returns a common search HParams for hyper-parameter tuning.
 
   Args:
     metric: The metric to optimize.
     max_num_trials: Max number of trials for tuning.
     goal: 'maximize' or 'minimize'.
+    errors_to_skip: An optional field to specify on what errors the trial
+      should be skipped. It's in the form of a list of (ExceptionType) or
+      (ExceptionType, regexForError). For example, if users specify:
+      `[RuntimeError, (Exception, 'XLACompilation.*')]`, the trails that
+      RuntimeError or errors that match 'XLACompilation.*' will be treated as
+      to skip.
+    cross_step_metric_aggregator: An optional cross-step metric aggregator
+      hparams indicating how metrics will be aggregated at the end of the search
+      for computing the reward. If None, the last reported metrics will be used.
+    early_stopping: An optional population-wise early stopping policy.
+      If None, no population-wise early stopping policy will be used, though
+      users still can raise `automl.EarlyStoppingError` to early terminate a
+      a single trial during training/evaluation.
+    reward_for_nan: An optional float used as the reward when metric value is
+      NaN. If not specified, the reward will remain NaN so the trial will be
+      skipped by the search algorithm.
 
   Returns:
     A search HParams object.
@@ -58,22 +102,36 @@ def hyperparameter_tuning(metric: Metric,
   return SearchHParams(
       # Use Sweeping for hyperparameter tuning.
       search_algorithm=Sweeping.HParams(),
-      search_reward=SingleObjective.HParams(metric=metric, goal=goal),
-      max_num_trials=max_num_trials)
+      search_reward=SingleObjective.HParams(
+          metric=metric, goal=goal, reward_for_nan=reward_for_nan),
+      early_stopping=early_stopping,
+      max_num_trials=max_num_trials,
+      errors_to_skip=errors_to_skip,
+      cross_step_metric_aggregator=cross_step_metric_aggregator)
 
 
-def neural_architecture_search(metrics: Union[Metric, Sequence[Metric]],
-                               cost_objective: Optional[float] = None,
-                               reward_type: str = 'tunas',
-                               exponent: float = -0.07,
-                               max_num_trials: int = 10000) -> SearchHParams:
+def neural_architecture_search(
+    metrics: Union[Metric, Sequence[Metric]],
+    cost_objective: Optional[float] = None,
+    reward_type: str = 'tunas',
+    exponent: float = -0.07,
+    max_num_trials: int = 10000,
+    errors_to_skip: Optional[List[
+        Union[Type[Exception], Tuple[Type[Exception], str]]]] = None,
+    cross_step_metric_aggregator: Optional[
+        CrossStepMetricAggregator.HParams] = None,
+    early_stopping: Optional[
+        BaseEarlyStoppingPolicy.HParams] = None,
+    reward_for_nan: Optional[float] = None
+    ) -> SearchHParams:
   """Search params for Neural Architecture Search."""
 
   if isinstance(metrics, Metric):
     metrics = [metrics]
 
   if len(metrics) == 1:
-    reward = SingleObjective.HParams(metric=metrics[0])
+    reward = SingleObjective.HParams(
+        metric=metrics[0], reward_for_nan=reward_for_nan)
   elif len(metrics) == 2:
     if cost_objective is None:
       raise ValueError('cost objective must be provided.')
@@ -89,14 +147,18 @@ def neural_architecture_search(metrics: Union[Metric, Sequence[Metric]],
     reward = MultiObjective.HParams(
         metrics=metrics,
         aggregator=aggregator_cls.HParams(
-            cost_objective=cost_objective, exponent=exponent))
+            cost_objective=cost_objective, exponent=exponent),
+        reward_for_nan=reward_for_nan)
   else:
     raise ValueError('Only 1 or 2 metrics are supported.')
 
   return SearchHParams(
       search_algorithm=RegularizedEvolution.HParams(),
       search_reward=reward,
-      max_num_trials=max_num_trials)
+      early_stopping=early_stopping,
+      max_num_trials=max_num_trials,
+      errors_to_skip=errors_to_skip,
+      cross_step_metric_aggregator=cross_step_metric_aggregator)
 
 
 #
@@ -179,9 +241,13 @@ class SingleObjective(BaseReward):
       metric_key: The key of metric whose value will be used as reward.
       goal: Defines how the metric should be optimized. Acceptable values are
         'maximize' or 'minimize'.
+      reward_for_nan: An optional float used as the reward when metric value is
+        NaN. If not specified, the reward will remain NaN so the trial will be
+        skipped by the search algorithm.
     """
     metric: Optional[Metric] = None
     goal: str = 'maximize'
+    reward_for_nan: Optional[float] = None
 
     def __post_init__(self):
       super().__post_init__()
@@ -194,9 +260,17 @@ class SingleObjective(BaseReward):
   def __call__(self, metrics_dict: Dict[str, float], global_step: int) -> float:
     del global_step
     reward = self._hparams.metric.get_value(metrics_dict)
+
     if self._hparams.goal == 'minimize':
       reward *= -1
+    if self._hparams.reward_for_nan is not None and math.isnan(reward):
+      reward = self._hparams.reward_for_nan
     return reward
+
+  @property
+  def used_metrics(self) -> Sequence[Metric]:
+    assert self._hparams.metric is not None
+    return [self._hparams.metric]
 
 
 class MultiObjectiveAggregator(BaseParameterizable, metaclass=abc.ABCMeta):
@@ -220,9 +294,13 @@ class MultiObjective(BaseReward):
       metric_keys: The keys of metric whose value will be used as reward.
       aggregator: Multi-objective aggregator for coupling multiple values into a
         single float value.
+      reward_for_nan: An optional float used as the reward when metric value is
+        NaN. If not specified, the reward will remain NaN so the trial will be
+        skipped by the search algorithm.
     """
     metrics: Optional[Sequence[Metric]] = None
     aggregator: Optional[MultiObjectiveAggregator.HParams] = None
+    reward_for_nan: Optional[float] = None
 
     def __post_init__(self):
       super().__post_init__()
@@ -240,10 +318,18 @@ class MultiObjective(BaseReward):
   def __call__(self, metrics_dict: Dict[str, float], global_step: int) -> float:
     del global_step
     metric_values = [m.get_value(metrics_dict) for m in self._hparams.metrics]
+    if (self._hparams.reward_for_nan is not None
+        and any(math.isnan(m) for m in metric_values)):
+      return self._hparams.reward_for_nan
     if len(metric_values) == 1:
       return metric_values[0]
     assert self._aggregator is not None
     return self._aggregator(metric_values)
+
+  @property
+  def used_metrics(self) -> Sequence[Metric]:
+    assert self._hparams.metrics is not None
+    return self._hparams.metrics
 
 
 class TwoObjectiveAggregator(MultiObjectiveAggregator):
@@ -329,6 +415,199 @@ class MnasSoft(TwoObjectiveAggregator):
     cost_ratio = cost / self._hparams.cost_objective
     cost_adjustment = pow(cost_ratio, self._hparams.exponent)
     return quality * cost_adjustment
+
+
+#
+# Common metric aggregators across multiple steps.
+#
+
+
+class MultiSubExperimentCrossStepMetricAggregator(CrossStepMetricAggregator):
+  """Metric aggregator with sub-experiment support."""
+
+  def __call__(
+      self, metrics_across_steps: Sequence[Tuple[int, Dict[str, float]]]
+      ) -> Dict[str, float]:
+    merged_metrics_across_steps = self._merge_metrics(metrics_across_steps)
+    return self.call(merged_metrics_across_steps)
+
+  def _merge_metrics(
+      self, metrics_across_steps: Sequence[Tuple[int, Dict[str, float]]]
+      ) -> Sequence[Tuple[int, Dict[str, float]]]:
+    """Merges metrics from sub-experiments."""
+    merged_metrics_across_steps = collections.defaultdict(dict)
+    for step, metrics in metrics_across_steps:
+      step = step % SUB_EXPERIMENT_STEP_OFFSET
+      merged_metrics_across_steps[step].update(metrics)
+    return [(s, m) for s, m in merged_metrics_across_steps.items()]
+
+  @abc.abstractmethod
+  def call(
+      self, merged_metrics_across_steps: Sequence[Tuple[int, Dict[str, float]]]
+      ) -> Dict[str, float]:
+    """Aggregates metrics from merged metrics from multiple sub-experiments."""
+
+
+class LastReportedMetricValues(MultiSubExperimentCrossStepMetricAggregator):
+  """Returns the last reported metrics."""
+
+  def call(
+      self, merged_metrics_across_steps: Sequence[Tuple[int, Dict[str, float]]]
+      ) -> Dict[str, float]:
+    """Returns an aggregated metric dict from metrics from multiple steps."""
+    return merged_metrics_across_steps[-1][1]
+
+
+class AverageMetricValues(MultiSubExperimentCrossStepMetricAggregator):
+  """Returns the average values of per-step metrics."""
+
+  class HParams(MultiSubExperimentCrossStepMetricAggregator.HParams):
+    """Hyperparameters for AverageMetricValues.
+
+    Attributes:
+      last_n: If not None, then only the `last_n` values will be used in the
+              metric average. If None, all values are used.
+    """
+    last_n: Optional[int] = None
+
+  def call(
+      self, merged_metrics_across_steps: Sequence[Tuple[int, Dict[str, float]]]
+      ) -> Dict[str, float]:
+    """Returns an aggregated metric dict from metrics from multiple steps."""
+    accumulated_metrics = collections.defaultdict(list)
+    for _, step_metrics in merged_metrics_across_steps:
+      for k, v in step_metrics.items():
+        accumulated_metrics[k].append(v)
+
+    metrics = {}
+    for k, v in accumulated_metrics.items():
+      if self._hparams.last_n is not None:
+        metrics[k] = sum(v[-self._hparams.last_n:]) / len(
+            v[-self._hparams.last_n:])
+      else:
+        metrics[k] = sum(v) / len(v)
+    return metrics
+
+
+class MetricsWithMaxValue(MultiSubExperimentCrossStepMetricAggregator):
+  """Returns the step metrics which has the max value on a metric."""
+
+  class HParams(MultiSubExperimentCrossStepMetricAggregator.HParams):
+    """Hyperparameters for ValueWithMax.
+
+    Attributes:
+      metric: An optional metric against whom to choose the max value.
+        If None, the comparison is against the reward.
+    """
+    metric: Optional[Metric] = None
+
+  def call(
+      self, merged_metrics_across_steps: Sequence[Tuple[int, Dict[str, float]]]
+      ) -> Dict[str, float]:
+    """Returns an aggregated metric dict from metrics from multiple steps."""
+    metric = self._hparams.metric or Metric('reward')
+    max_i, max_value = None, None
+    # TODO(daiyip): current code assumes that all metrics are reported at
+    # the same step, which might not be the case if we allow multiple processes
+    # to report the measurement. We may need to revisit the implementation once
+    # multi-role reporting is supported.
+    for i, (_, step_metrics) in enumerate(merged_metrics_across_steps):
+      v = metric.get_value(step_metrics)
+      if max_value is None or v >= max_value:
+        max_i, max_value = i, v
+    return merged_metrics_across_steps[max_i][1]
+
+
+class MetricsWithMinValue(MultiSubExperimentCrossStepMetricAggregator):
+  """Returns the step metrics which has the min value on an metric."""
+
+  class HParams(MultiSubExperimentCrossStepMetricAggregator.HParams):
+    """Hyperparameters for ValueWithMax.
+
+    Attributes:
+      metric: An optional metric against whom to choose the max value.
+        If None, the comparison is against the reward.
+    """
+    metric: Optional[Metric] = None
+
+  def call(
+      self, merged_metrics_across_steps: Sequence[Tuple[int, Dict[str, float]]]
+      ) -> Dict[str, float]:
+    """Returns an aggregated metric dict from metrics from multiple steps."""
+    metric = self._hparams.metric or Metric('reward')
+    min_i, min_value = None, None
+    for i, (_, step_metrics) in enumerate(merged_metrics_across_steps):
+      v = metric.get_value(step_metrics)
+      if min_value is None or v <= min_value:
+        min_i, min_value = i, v
+    return merged_metrics_across_steps[min_i][1]
+
+#
+# Population-wiise early stopping policies.
+#
+
+
+class EarlyStoppingByValue(BaseEarlyStoppingPolicy):
+  """Early stopping based on the absolute value of a metric at a step."""
+
+  class HParams(BaseEarlyStoppingPolicy.HParams):
+    """Hyperparameters for value-based early stopping policy.
+
+    Attributes:
+      step_values: A list of tuples for defining gating rules:
+        (step, threshold value).
+      metric: Metric to watch. If None, it watches the reward at the step.
+      maximize: If True, value below the threshold will be stopped. Otherwise
+        values above the threshold.
+    """
+    step_values: Optional[List[Tuple[int, float]]] = None
+    metric: Optional[Metric] = None
+    maximize: bool = True
+
+  def __call__(self) -> pg.early_stopping.StepWise:
+    def metric_to_watch(m: pg.tuning.Measurement) -> float:
+      metric = self._hparams.metric
+      if metric is None:
+        return m.reward
+      return metric.get_value(m.metrics)
+    return pg.early_stopping.early_stop_by_value(
+        step_values=self._hparams.step_values,
+        metric=metric_to_watch,
+        maximize=self._hparams.maximize)()
+
+
+class EarlyStoppingByRank(BaseEarlyStoppingPolicy):
+  """Early stopping based on the rank of a metric at a step."""
+
+  class HParams(BaseEarlyStoppingPolicy.HParams):
+    """Hyperparameters for rank-based early stopping policy.
+
+    Attributes:
+      step_ranks: A list of tuples for defining gating rules:
+        (step, threshold rank or threshold percentage, min_histogram_size).
+      metric: Metric to watch. If None, it watches the reward at the step.
+      maximize: If True, the sorting for computing the rank is from the largest
+        to the smallest, otherwise will be the smallest to the largest.
+    """
+    step_ranks: Optional[List[Tuple[int, Union[int, float], int]]] = None
+    metric: Optional[Metric] = None
+    maximize: bool = True
+
+  def __call__(self) -> pg.early_stopping.StepWise:
+    def metric_to_watch(m: pg.tuning.Measurement) -> float:
+      metric = self._hparams.metric
+      if metric is None:
+        return m.reward
+      return metric.get_value(m.metrics)
+    return pg.early_stopping.early_stop_by_rank(
+        step_ranks=self._hparams.step_ranks,
+        metric=metric_to_watch,
+        maximize=self._hparams.maximize)()
+
+
+#
+# Exception used to early stop a trial.
+#
 
 
 class EarlyStoppingError(BaseException):

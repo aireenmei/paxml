@@ -17,13 +17,14 @@
 
 import numbers
 import typing
-from typing import Any, Dict, Optional, Sequence, Union
+from typing import Any, Dict, Mapping, Optional, Sequence, Union
+
 from absl import logging
-
 import clu.values as clu_values
+import jax
 from jax import numpy as jnp
+from jax.experimental import global_device_array
 import numpy as np
-
 from paxml import summary_utils
 from praxis import py_utils
 from praxis import pytypes
@@ -39,8 +40,7 @@ WeightedScalars = pytypes.WeightedScalars
 WeightedScalarsList = pytypes.WeightedScalarsList
 
 NestedMap = py_utils.NestedMap
-SummaryValueTypes = Union[
-    clu_values.Scalar, clu_values.Image, clu_values.Text]
+SummaryValueTypes = Union[clu_values.Scalar, clu_values.Image, clu_values.Text]
 
 
 _VALUES_TO_SUMMARY_TYPE = {
@@ -122,7 +122,7 @@ def write_clu_metric_summaries(
         step_i, metric_name, metric_value.value, summary_type)
 
 
-def write_seqio_metric_summaries(seqio_metrics: Sequence[Dict[str, Union[
+def write_seqio_metric_summaries(seqio_metrics: Sequence[Mapping[str, Union[
     seqio.metrics.MetricValue, float]]], metric_name_prefix: str,
                                  step: int) -> None:
   """Write seqio metric as tensorboard summaries.
@@ -143,6 +143,21 @@ def write_seqio_metric_summaries(seqio_metrics: Sequence[Dict[str, Union[
                      metric_str)
         tf_summary.text(metric_name, metric_str, step=step)
         continue
+
+      if isinstance(v, seqio.metrics.Audio):
+        logging.info('Writing summary of %s with audio.', metric_name)
+        tf_summary.audio(
+            metric_name,
+            v.audiodata,
+            v.sample_rate,
+            step=step,
+            max_outputs=v.max_outputs)
+        continue
+
+      if isinstance(v, seqio.metrics.Generic):
+        tf_summary.write(metric_name, v.tensor, metadata=v.metadata, step=step)
+        continue
+
       if isinstance(v, seqio.metrics.Scalar):
         v = float(v.value)
       else:
@@ -152,15 +167,15 @@ def write_seqio_metric_summaries(seqio_metrics: Sequence[Dict[str, Union[
                                          summary_utils.SummaryType.SCALAR)
 
 
-def _is_nparray_like(v: Any) -> bool:
-  """Returns True if input is a NumPy array-like instance."""
-  return isinstance(v, (np.ndarray, jnp.ndarray))
+def is_scalar(v: Any) -> bool:
+  """Returns True if input is a scalar."""
+  return isinstance(v, (numbers.Number, np.ndarray, jnp.ndarray, global_device_array.GlobalDeviceArray, jax.Array))
 
 
 def is_weighted_scalar(v: Any) -> bool:
   """Returns True if input is a weighted scalar."""
-  return (isinstance(v, tuple) and len(v) == 2 and _is_nparray_like(v[0]) and
-          _is_nparray_like(v[1]))
+  return (isinstance(v, tuple) and len(v) == 2 and is_scalar(v[0]) and
+          is_scalar(v[1]))
 
 
 def is_float_convertible(metric_value: Union[numbers.Number, clu_values.Value,
@@ -194,8 +209,11 @@ def as_float(
 
 
 def as_float_dict(
-    metric_output: Union[Dict[str, SummaryValueTypes], WeightedScalars,
-                         WeightedScalarsList],
+    metric_output: Union[
+        Dict[str, Union[SummaryValueTypes]],
+        WeightedScalars,
+        WeightedScalarsList,
+        Mapping[str, Union[seqio.metrics.MetricValue, float]]],
     raise_on_non_float_convertible: bool = False) -> Dict[str, float]:
   """Returns a float dict from heterogeneous metric output."""
   results = {}

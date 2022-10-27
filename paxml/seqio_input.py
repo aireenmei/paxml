@@ -19,13 +19,17 @@ from __future__ import annotations
 
 import collections
 import enum
+import io
 import os
-from typing import Any, Dict, Mapping, Optional, Sequence, TextIO, Tuple, Union
+import typing
+from typing import Any, Dict, List, Mapping, Optional, Sequence, TextIO, Tuple, Union
 
 from absl import logging
+import jax
 from jax.experimental import multihost_utils
 import jax.numpy as jnp
 import numpy as np
+from paxml import metric_utils
 from praxis import base_hyperparams
 from praxis import base_input
 from praxis import py_utils
@@ -37,11 +41,18 @@ sub_config_field = base_hyperparams.sub_config_field
 NestedMap = py_utils.NestedMap
 NestedNpTensor = pytypes.NestedNpTensor
 ParamsT = pytypes.HParamsT
+SummaryWriter = tf.summary.SummaryWriter
 
-PROVENANCE_PREFIX = 'provenance'
-SHARD_INDEX_KEY = os.path.join(PROVENANCE_PREFIX, 'shard_index')
-NUM_SHARDS_KEY = os.path.join(PROVENANCE_PREFIX, 'num_shards')
-INDEX_WITHIN_SHARD_KEY = os.path.join(PROVENANCE_PREFIX, 'index_within_shard')
+SHARD_INDEX_KEY = py_utils.SHARD_INDEX_KEY
+NUM_SHARDS_KEY = py_utils.NUM_SHARDS_KEY
+INDEX_WITHIN_SHARD_KEY = py_utils.INDEX_WITHIN_SHARD_KEY
+EVAL_METRICS_PREFIX = 'scoring_eval'
+DECODE_METRICS_PREFIX = 'decoder'
+
+# TODO(b/244434890): enable computing SeqIO task-defined metrics on model
+# outputs other than models.LanguageModel.
+_LM_DECODER_OUT_KEY = 'decoded_substr'
+_LM_SCORE_KEY = 'scores'
 
 
 def _update_keys(answers: Dict[str, Any], targets: Mapping[str, Any],
@@ -80,16 +91,97 @@ def _get_targets_str(example: Mapping[str, Any], task: seqio.Task) -> str:
   return target
 
 
-def get_example_id(index_within_shard: int, shard_index: int,
-                   num_shards: int) -> Optional[str]:
-  """Construct a unique ID from enumeration provenance fields."""
-  if shard_index >= num_shards:
-    raise ValueError(
-        'shard_index must be less than the total number of shards'
-        f' (shard_index={shard_index}, num_shards={num_shards})')
+def _log_plain_text_output(
+    answers: Mapping[str, NestedMap], plain_text_output: TextIO) -> None:
+  """Logs all examples for inspection in plain text format."""
+  for _, ans in answers.items():
+    print('---', file=plain_text_output)
+    print(ans.get('prefix', ''), file=plain_text_output)
+    print('>>>', file=plain_text_output)
+    print(ans.get(_LM_DECODER_OUT_KEY, ''), file=plain_text_output)
+    print(ans[_LM_DECODER_OUT_KEY], file=plain_text_output)
+    if 'seqio_targets' in ans:
+      print('REF', file=plain_text_output)
+      print(ans['seqio_targets'], file=plain_text_output)
 
-  return os.path.join(f'index_within_shard={index_within_shard}',
-                      f'shard_index={shard_index}', f'num_shards={num_shards}')
+
+def _convert_bytes_to_str(tree: Any) -> Any:
+  """Converts any bytes leafs to strings in a pytree."""
+  def _convert_fn(leaf: Any) -> Any:
+    if not isinstance(leaf, bytes):
+      return leaf
+
+    return leaf.decode('utf-8')
+
+  return jax.tree_map(_convert_fn, tree)
+
+
+def should_process_outputs(inp: base_input.BaseInput) -> bool:
+  """Whether the current (input, process_index) pair should process outputs."""
+  return (inp.hparams.reset_for_eval and isinstance(inp, SeqIOInput)
+          and jax.process_index() == 0)
+
+
+def process_outputs(
+    inp: base_input.BaseInput,
+    model_outputs: Union[List[Dict[str, Any]], List[Tuple[str, Any]]],
+    summary_writer: SummaryWriter,
+    metric_type: MetricType,
+    step: int,
+    verbose_entries: int = 1,
+    plain_text_output_fname: Optional[str] = None) -> Dict[str, float]:
+  """Computes SeqIO task-defined metric, write to TB, and returns mapping."""
+  inp = typing.cast(SeqIOInput, inp)
+  logging.info('Computing %s metrics', metric_type.name)
+
+  if metric_type is MetricType.SCORE:
+    metric_name_prefix = EVAL_METRICS_PREFIX
+    # model_outputs = typing.cast(List[Mapping[str, Any]], model_outputs)
+    seqio_metrics = inp.compute_metrics_eval(
+        model_outputs, verbose_entries=verbose_entries)
+    logging.info('Eval metrics from seqio: %s.', seqio_metrics)
+
+  elif metric_type is MetricType.PREDICT:
+    metric_name_prefix = DECODE_METRICS_PREFIX
+    plain_text_output = io.StringIO()
+    seqio_metrics = inp.compute_metrics(
+        model_outputs, verbose_entries=verbose_entries,
+        plain_text_output=plain_text_output)
+
+    logging.info('Writing plain decoder output to %s', plain_text_output_fname)
+    dirname = os.path.dirname(plain_text_output_fname)
+    if not tf.io.gfile.exists(dirname):
+      tf.io.gfile.makedirs(dirname)
+    with tf.io.gfile.GFile(plain_text_output_fname, 'w') as f:
+      f.write(plain_text_output.getvalue())
+
+    # Write out seqio metrics with JSON logger to JSONL file
+    logger = seqio.loggers.JSONLogger(dirname)
+    merged_seqio_metrics = {}
+    for sm in seqio_metrics:
+      merged_seqio_metrics.update(sm)
+
+    logger(task_name=inp.mixture_or_task.name, step=step,
+           metrics=merged_seqio_metrics, dataset=None, inferences=None,
+           targets=None)
+
+  else:
+    raise ValueError(f'unsupported metric type: {metric_type}')
+
+  # write metrics to tensorboard
+  with summary_writer.as_default():
+    metric_utils.write_seqio_metric_summaries(
+        seqio_metrics, metric_name_prefix, step)
+
+  # convert metrics to {string: float} mapping
+  metrics = {}
+  for sm in seqio_metrics:
+    # TODO(b/244579359): add `metric_name_prefix` to key names when
+    # consolidating seqio vs non-seqio metrics in AutoML.
+    metrics = metric_utils.update_float_dict(
+        metrics, metric_utils.as_float_dict(sm))
+
+  return metrics
 
 
 class SeqIOInput(base_input.BaseInput):
@@ -234,14 +326,27 @@ class SeqIOInput(base_input.BaseInput):
     else:
       logging.info(message)
 
+  def _validate_eval_task(self):
+    assert isinstance(self.mixture_or_task, seqio.Task)
+    p = self.hparams
+
+    # weights_on_targets_only must be true if computing scoring metric fns and
+    # using LanguageModelFeatures as feature converter.
+    if (self.mixture_or_task.score_metric_fns
+        and isinstance(p.feature_converter, LanguageModelFeatures)
+        and not p.feature_converter.weights_on_targets_only):
+      raise ValueError(
+          'All language modeling scoring evals must set '
+          'LanguageModelFeatures.weights_on_targets_only=True')
+
   def _validate_hparams(self):
     p = self.hparams
     if not p.mixture_name and not p.mixture_or_task:
       raise ValueError("One of 'mixture_name' and 'task' must be set.")
     if p.mixture_name and p.mixture_or_task:
       raise ValueError(
-          "Only one of 'mixture_name' and 'mixture_or_task' can be set. Got %s and %s."
-          % (p.mixture_name, p.mixture_or_task))
+          "Only one of 'mixture_name' and 'mixture_or_task' can be set."
+          " Got %s and %s." % (p.mixture_name, p.mixture_or_task))
     if p.is_training and p.split_name != 'train':
       logging.warn(
           'SeqIO input hparams p.is_training=True but p.split_name is '
@@ -258,6 +363,9 @@ class SeqIOInput(base_input.BaseInput):
                  shard_info.num_shards)
     self._shard_info = shard_info
     self._validate_deterministic()
+
+    if not p.is_training and isinstance(self.mixture_or_task, seqio.Task):
+      self._validate_eval_task()
 
   @property
   def is_deterministic(self) -> bool:
@@ -288,7 +396,7 @@ class SeqIOInput(base_input.BaseInput):
     p = self.hparams
     logging.info(
         "Initializing dataset for task '%s' with a per host batch size of %d "
-        'and a seed of %s', self._mixture_or_task.name, p.batch_size,
+        'and a seed of %s', self.mixture_or_task.name, p.batch_size,
         p.input_random_seed)
     ds = self._get_backing_ds(
         shuffle=self.shuffle,
@@ -309,7 +417,7 @@ class SeqIOInput(base_input.BaseInput):
       self, ids: pytypes.NpTensor,
       lengths: Union[pytypes.NpTensor, Sequence[pytypes.NpTensor]],
       key: Optional[str] = None) -> Sequence[str]:
-    features = self._mixture_or_task.output_features
+    features = self.mixture_or_task.output_features
     if key is None:
       vocab = features['targets'].vocabulary
     elif key not in ['src', 'tgt']:
@@ -330,11 +438,16 @@ class SeqIOInput(base_input.BaseInput):
 
   def _enumerate(self, ds: tf.data.Dataset,
                  shard_info: seqio.ShardInfo) -> tf.data.Dataset:
-    """Adds provenance enumeration fields."""
+    """Add enumeration fields, only meaningful when is_training=False."""
+    p = self.hparams
 
     def _add_shard_enumeration(ex: Dict[str, Any]) -> Dict[str, Any]:
-      ex[SHARD_INDEX_KEY] = shard_info.index
-      ex[NUM_SHARDS_KEY] = shard_info.num_shards
+      shard_idx, num_shards = -1, -1
+      if not p.is_training:
+        shard_idx, num_shards = shard_info.index, shard_info.num_shards
+
+      ex[SHARD_INDEX_KEY] = shard_idx
+      ex[NUM_SHARDS_KEY] = num_shards
       return ex
 
     def _fold_in_local_enumeration(index_within_shard: int,
@@ -342,9 +455,17 @@ class SeqIOInput(base_input.BaseInput):
       ex[INDEX_WITHIN_SHARD_KEY] = index_within_shard
       return ex
 
+    def _fake_local_enumeration(ex: Dict[str, Any]) -> Dict[str, Any]:
+      ex[INDEX_WITHIN_SHARD_KEY] = -1
+      return ex
+
     ds = ds.map(_add_shard_enumeration, num_parallel_calls=tf.data.AUTOTUNE)
-    ds = ds.enumerate()
-    ds = ds.map(_fold_in_local_enumeration, num_parallel_calls=tf.data.AUTOTUNE)
+    if not p.is_training:
+      ds = ds.enumerate()
+      ds = ds.map(_fold_in_local_enumeration,
+                  num_parallel_calls=tf.data.AUTOTUNE)
+    else:
+      ds = ds.map(_fake_local_enumeration, num_parallel_calls=tf.data.AUTOTUNE)
 
     return ds
 
@@ -353,7 +474,7 @@ class SeqIOInput(base_input.BaseInput):
                       num_epochs: int,
                       shard_info: Optional[seqio.ShardInfo]) -> tf.data.Dataset:
     p = self.hparams
-    ds = self._mixture_or_task.get_dataset(
+    ds = self.mixture_or_task.get_dataset(
         sequence_length=p.task_feature_lengths,
         split=p.split_name,
         shuffle=shuffle,
@@ -364,6 +485,7 @@ class SeqIOInput(base_input.BaseInput):
         trim_output_features=p.trim_output_features)
 
     ds = p.feature_converter(ds, task_feature_lengths=p.task_feature_lengths)
+
     if p.use_enumeration:
       # We want to add enumeration provenance fields *after* applying all
       # feature converters since feature converters don't pass through
@@ -427,67 +549,21 @@ class SeqIOInput(base_input.BaseInput):
     pad_ds = self._get_one_example_ds(ds).map(_add_pad).repeat(pad_num)
     return ds.concatenate(pad_ds)
 
-  def compute_metrics(
-      self,
-      decoder_outputs: Sequence[Tuple[str, NestedMap]],
-      verbose_entries: Optional[int] = 0,
-      plain_text_output: Optional[TextIO] = None,
-  ) -> Sequence[Mapping[str, Union[seqio.metrics.MetricValue, float]]]:
-    """Computes metrics from the given decoder outputs using predict_metric_fns.
-
-    TODO(b/241386390): use enumeration ID instead of prefix-matching
-    when `hparams.use_enumeration = True`.
-
-    This function basically does the following:
-      1. Iterate through SeqIO task's dataset to construct both (a) the
-        input prefix-based key, and (b) the task.postprocess_fn(ex['targets']),
-        which is the target that is used to compute metrics.
-      2. Iterate through the keys generated in (1) to "left-join" with the
-        decoder_outputs mapping.
-      3. Feed the prefix-key mapped list of decoder_outputs and targets through
-        all task.predict_metric_fns.
-      4. Optionally log a couple entries for inspection.
-      5. Optionally log all entries in text format for inspection.
-
-    For tasks with score_metric_fns, use compute_metrics_eval() below.
-
-    Arguments:
-      decoder_outputs: a sequence of (str, dict) where the 0-th arg of the tuple
-        is the "prefix key", which is what is used to map between decoder
-        outputs and seqio's target sequences when computing metrics. This is
-        typically just the output of a model's `process_decode_out` method, but
-        can also be read from disk using `io_utils.load_outputs()`.
-      verbose_entries: int, how many entries to log for inspection and sanity
-        checking.
-      plain_text_output: optional output file to write decoder outputs in plain text
-        format for easier inspection
-    Returns:
-      The results of predict_metric_fns computed on the decoder outputs.
-      Typically a list of metrics, each element being a mapping from a string
-      metric name to a float.
-    """
-    # TODO(b/236078932): integrate with seqio evaluator.
-    # Current known limitations: assumes LanguageModel decoder output format,
-    # specifically the prediction string has key='decoded_substr'.
-    # Also assumes inputs and targets field names are 'inputs' and 'targets'.
+  def _build_predict_metric_inputs_with_prefix(
+      self, answers: Dict[str, NestedMap], verbose_entries: int,
+      plain_text_output: Optional[TextIO] = None) -> Tuple[
+          Sequence[str], Sequence[str]]:
+    """Builds 1-to-1 mapped predictions and targets lists via prefix matches."""
+    # TODO(b/241386390): deprecate prefix-based matching for metrics computation
     p = self.hparams
-    task = self._mixture_or_task
-    if not isinstance(task, seqio.Task):
-      raise ValueError('compute_metrics() is only supported for seqio.Tasks, '
-                       f'got {type(self._mixture_or_task)} for {p.name}.')
-
-    # If there are no seqio decode/predict metrics to compute return empty list
-    if not task.predict_metric_fns:
-      return []
-
-    self._validate_compute_metrics_config(raise_exception=True)
+    assert not p.use_enumeration
 
     # Prepare ground truth label data by dumping out seqio eval dataset and
     # get a dict key-ed by detokenized inputs (tokenized inputs are truncated
     # to inputs_length).
     inputs_length = p.task_feature_lengths['inputs']
     targets_length = p.eval_metrics_targets_length
-    targets_ds = task.get_dataset(
+    targets_ds = self.mixture_or_task.get_dataset(
         sequence_length={
             'inputs': inputs_length,
             'targets': targets_length,
@@ -498,6 +574,7 @@ class SeqIOInput(base_input.BaseInput):
         seed=p.input_random_seed,
         use_cached=p.use_cached,
         trim_output_features=p.trim_output_features)
+
     # Note that lists are used per prefix since there may be duplicates
     targets = collections.defaultdict(list)
     examples = collections.defaultdict(list)
@@ -507,28 +584,38 @@ class SeqIOInput(base_input.BaseInput):
       # wouldn't match with the keys we get from the model inference path.
       key = self.ids_to_strings(e['inputs'][np.newaxis, :],
                                 lengths=[inputs_length], key='src')[0]
-      t = _get_targets_str(e, self._mixture_or_task)
-      targets[key].append(task.postprocess_fn(t, example=e, is_target=True))
+      t = _get_targets_str(e, self.mixture_or_task)
+      targets[key].append(self.mixture_or_task.postprocess_fn(
+          t, example=e, is_target=True))
       examples[key].append(e)
 
-    # Get decoder outputs key-ed by input str (tokenized then detokenized) and
-    # truncated to p.task_feature_lengths['inputs'].
-    answers = dict(decoder_outputs)
-    _update_keys(answers, targets, task.name)
+    # In case the prefix returned by the model are prefixes of the keys
+    # re-constructed here. This can sometimes be needed due to truncation of
+    # the original key during input processing.
+    _update_keys(answers, targets, self.mixture_or_task.name)
 
     # Construct (decode output, seqio target) lists by joining on seqio's
     # detok(tok(features['inputs'])[:task_feature_lengths['inputs']])).
     predictions_list = []
     targets_list = []
     for k in targets:
+      if k not in answers:
+        raise ValueError(
+            f'Example not found in decoder output (key={k}): {targets[k]}')
       ans = answers[k]
-      answer = ans['decoded_substr']
-      # this line mutates 'decoder_outputs' which is written to disk afterwards
-      ans['seqio_targets'] = targets[k]
+      answer = ans[_LM_DECODER_OUT_KEY]
+      seqio_postprocessed_predictions = []
       for target, e in zip(targets[k], examples[k]):
         targets_list.append(target)
-        prediction = task.postprocess_fn(answer, example=e, is_target=False)
+        prediction = self.mixture_or_task.postprocess_fn(
+            answer, example=e, is_target=False)
         predictions_list.append(prediction)
+        seqio_postprocessed_predictions.append(prediction)
+
+      # Mutate 'ans' dictionary which is written to disk afterwards
+      ans['seqio_targets'] = targets[k]
+      ans['seqio_postprocessed_predictions'] = (
+          _convert_bytes_to_str(seqio_postprocessed_predictions))
 
     eval_data_size = len(list(targets_ds.as_numpy_iterator()))
     logging.info('Data %s has %s examples for computing eval metrics.', p.name,
@@ -538,89 +625,128 @@ class SeqIOInput(base_input.BaseInput):
           f'Data {p.name} expects {eval_data_size} examples for computing eval'
           f' metrics, got {len(predictions_list)}.')
 
-    metrics = []
-    for fn in task.predict_metric_fns:
-      m = fn(targets_list, predictions_list)
-      logging.info('Metrics: %s', m)
-      metrics.append(m)
-
     # Log a few examples for inspection and sanity check.
     it = iter(targets)
     for i in range(verbose_entries):
       k = next(it)
       ans = answers[k]
       e = examples[k][0]
-      answer = ans['decoded_substr']
-      answer_processed = task.postprocess_fn(answer, example=e, is_target=False)
-      target = _get_targets_str(e, self._mixture_or_task)
-      target_processed = task.postprocess_fn(target, example=e, is_target=True)
+      answer = ans[_LM_DECODER_OUT_KEY]
+      answer_processed = self.mixture_or_task.postprocess_fn(
+          answer, example=e, is_target=False)
+      target = _get_targets_str(e, self.mixture_or_task)
+      target_processed = self.mixture_or_task.postprocess_fn(
+          target, example=e, is_target=True)
       logging.info(
-          'Example %d:\nPROMPT=%s\nMODEL=%s FROM %s\nLABEL=%s FROM %s.', i, k,
+          'Example %d:\nPROMPT=%s\nMODEL=%s\nFROM %s\nLABEL=%s FROM %s.', i, k,
           answer_processed, answer, target_processed, target)
 
     # Optionally log all examples for inspection in text format
     if plain_text_output is not None:
-      for _, ans in decoder_outputs:
-        print('---', file=plain_text_output)
-        print(ans.get('prefix', ''), file=plain_text_output)
-        print('>>>', file=plain_text_output)
-        print(ans.get('decoded_substr', ''), file=plain_text_output)
-        print(ans['decoded_substr'], file=plain_text_output)
-        if 'seqio_targets' in ans:
-          print('REF', file=plain_text_output)
-          print(ans['seqio_targets'], file=plain_text_output)
+      _log_plain_text_output(answers, plain_text_output)
 
-    return metrics
+    return predictions_list, targets_list
 
-  def compute_metrics_eval(
-      self,
-      eval_outputs: Sequence[Dict[str, py_utils.JTensor]],
-      verbose_entries: int = 0
-  ) -> Sequence[Mapping[str, Union[seqio.metrics.MetricValue, float]]]:
-    """Computes metrics from the given eval outputs using score_metric_fns.
-
-    TODO(b/241386390): use enumeration ID instead of prefix-matching
-    when `hparams.use_enumeration = True`.
-
-    This function basically does the following:
-      1. Iterate through SeqIO task's dataset to construct both (a) the 'labels'
-        tokens based key, and (b) the task.postprocess_fn(ex['targets']),
-        which is the target that is used to compute metrics.
-      2. Iterate through the keys generated in (1) to "left-join" with the
-        decoder_outputs mapping.
-      3. Feed the prefix-key mapped list of decoder_outputs and targets through
-        all task.predict_metric_fns.
-      4. Optionally log a couple entries for inspection.
-
-    For tasks with predict_metric_fns, use compute_metrics() above.
-
-    Args:
-      eval_outputs: A list of per_example_outputs. Each element is a nested map
-        from string to JTensor, and is expected to have keys `labels` and
-        `scores`. `labels` is int32 token ids and should be convertible to shape
-        [B, T], and `scores` is float and should be convertible to shape [B],
-        where B is batch size and T is sequence length.
-      verbose_entries: int, how many entries to log for inspection and sanity
-        checking.
-
-    Returns:
-      The results of score_metric_fns computed on the eval outputs.
-      Typically a list of metrics, each element being a mapping from a string
-      metric name to a float.
-    """
+  def _get_targets_with_enum_key(self) -> Mapping[str, NestedMap]:
     p = self.hparams
-    task = self._mixture_or_task
-    if not isinstance(task, seqio.Task):
-      raise ValueError('compute_metrics() is only supported for seqio.Tasks, '
-                       f'got {type(self._mixture_or_task)} for {p.name}.')
-    if not task.score_metric_fns:
-      return []
+    inputs_length = p.task_feature_lengths['inputs']
+    targets_length = p.eval_metrics_targets_length
 
-    self._validate_compute_metrics_config(raise_exception=True)
+    targets = {}
+    # simulate multi-host setup by iterating on multiple input generators
+    for host_idx in range(p.num_infeed_hosts):
+      shard_info = seqio.ShardInfo(
+          index=host_idx, num_shards=p.num_infeed_hosts)
+      targets_ds = self.mixture_or_task.get_dataset(
+          sequence_length={
+              'inputs': inputs_length,
+              'targets': targets_length,
+          },
+          split=p.split_name,
+          shuffle=False,
+          num_epochs=1,
+          shard_info=shard_info,
+          seed=p.input_random_seed,
+          use_cached=p.use_cached,
+          trim_output_features=p.trim_output_features)
+      targets_ds = self._enumerate(targets_ds, shard_info)
 
+      for e in targets_ds.as_numpy_iterator():
+        # remove enum related fields from example as seqio metric_fns API
+        # expects the output from the task dataset directly.
+        key = py_utils.get_enumeration_id(e, pop=True)
+        assert key is not None and key not in targets
+        targets[key] = e
+
+    return targets
+
+  def _build_predict_metric_inputs_with_enum(
+      self, answers: Mapping[str, NestedMap], verbose_entries: int,
+      plain_text_output: Optional[TextIO] = None) -> Tuple[
+          Sequence[Any], Sequence[Any]]:
+    """Builds 1-to-1 mapped predictions and targets lists using enum fields."""
+    assert self.hparams.use_enumeration
+
+    targets = self._get_targets_with_enum_key()
+
+    predictions_list = []
+    targets_list = []
+    # Construct (decode output, seqio target) lists by joining on enum IDs.
+    # "Left-join" using targets constructed since outputs may have been padded.
+    for k in targets:
+      if k not in answers:
+        raise ValueError(
+            f'Example not found in decoder output (key={k}): {targets[k]}')
+      ans = answers[k]
+      answer = ans[_LM_DECODER_OUT_KEY]
+
+      # postprocess model's decoder output
+      prediction = self.mixture_or_task.postprocess_fn(
+          answer, example=targets[k], is_target=False)
+      predictions_list.append(prediction)
+
+      # postprocess target example for target decoder output str
+      t = _get_targets_str(targets[k], self.mixture_or_task)
+      seqio_target = self.mixture_or_task.postprocess_fn(
+          t, example=targets[k], is_target=True)
+      targets_list.append(seqio_target)
+
+      # Mutate 'ans' dictionary which is written to disk afterwards
+      ans['seqio_targets'] = seqio_target
+      ans['seqio_postprocessed_predictions'] = (
+          _convert_bytes_to_str(prediction))
+
+    # Log a few examples for inspection and sanity check.
+    it = iter(targets)
+    for i in range(verbose_entries):
+      k = next(it)
+      ans = answers[k]
+      e = targets[k]
+      answer = ans[_LM_DECODER_OUT_KEY]
+      answer_processed = self.mixture_or_task.postprocess_fn(
+          answer, example=e, is_target=False)
+      target = _get_targets_str(e, self.mixture_or_task)
+      target_processed = self.mixture_or_task.postprocess_fn(
+          target, example=e, is_target=True)
+      logging.info(
+          'Example %d:\nPROMPT=%s\nMODEL=%s\nFROM %s\nLABEL=%s FROM %s.',
+          i, ans['prefix'], answer_processed, answer, target_processed, target)
+
+    # Optionally log all examples for inspection in text format
+    if plain_text_output is not None:
+      _log_plain_text_output(answers, plain_text_output)
+
+    return predictions_list, targets_list
+
+  def _build_scoring_metric_inputs_with_labels(
+      self, eval_outputs: Sequence[Dict[str, py_utils.JTensor]],
+      verbose_entries: int) -> Tuple[Sequence[Any], Sequence[Any]]:
+    """Build 1-to-1 mapped scores and targets for metrics via label matching."""
+    # TODO(b/241386390): deprecate label-based matching for metrics computation.
+    p = self.hparams
     # Prepare ground truth label data by dumping out seqio eval dataset and
     # produce a dict key-ed by tuple of `labels` token ids.
-    targets_ds = task.get_dataset(
+    targets_ds = self.mixture_or_task.get_dataset(
         sequence_length=p.task_feature_lengths,
         split=p.split_name,
         shuffle=False,
@@ -641,7 +767,7 @@ class SeqIOInput(base_input.BaseInput):
     answers = dict()
     for element in eval_outputs:
       labels = np.asarray(element['labels'])
-      scores = np.asarray(element['scores'])
+      scores = np.asarray(element[_LM_SCORE_KEY])
       if len(labels.shape) > 2:
         labels = np.reshape(labels, [-1, labels.shape[-1]])
       if len(scores.shape) > 1:
@@ -656,19 +782,22 @@ class SeqIOInput(base_input.BaseInput):
     verbose_entries_idx = 0
     for k in targets:
       if k not in answers:
-        raise ValueError(f'Example not found in eval output: {targets[k][0]}')
+        raise ValueError(
+            f'Example not found in eval output (key={k}): {targets[k][0]}')
       target = targets[k]
       score = answers[k]
       for e in targets[k]:
-        target_post = task.postprocess_fn(target, example=e, is_target=True)
+        target_post = self.mixture_or_task.postprocess_fn(
+            target, example=e, is_target=True)
         targets_list.append(target_post)
         scores_list.append(score)
         if verbose_entries_idx < verbose_entries:
           logging.info(
               'inputs_pretokenized=%s\ntargets_pretokenized=%s\n'
               'is_correct=%s\ntarget=%s\nscore=%s\n\n',
-              e['inputs_pretokenized'], e['targets_pretokenized'],
-              e.get('is_correct', 'N/A'), target_post, score)
+              e.get('inputs_pretokenized', 'None'),
+              e.get('targets_pretokenized', 'None'), e.get('is_correct', 'N/A'),
+              target_post, score)
           verbose_entries_idx += 1
 
     eval_data_size = len(list(targets_ds.as_numpy_iterator()))
@@ -678,6 +807,207 @@ class SeqIOInput(base_input.BaseInput):
       raise ValueError(
           f'Data {p.name} expects {eval_data_size} examples for computing eval'
           f' metrics, got {len(scores_list)}.')
+
+    return scores_list, targets_list
+
+  def _build_scoring_metric_inputs_with_enum(
+      self, eval_outputs: Sequence[Dict[str, py_utils.JTensor]],
+      verbose_entries: int) -> Tuple[Sequence[Any], Sequence[Any]]:
+    assert self.hparams.use_enumeration
+
+    targets = self._get_targets_with_enum_key()
+
+    # Group model's scoring outputs by enum key.
+    answers = {}
+    for batch in eval_outputs:
+      # transfer to cpu
+      batch = jax.tree_map(np.asarray, batch)
+      for eval_example in py_utils.tree_unstack(batch, 0):
+        key = py_utils.get_enumeration_id(eval_example)
+        if not key:
+          raise ValueError('key should not be None when enum-matching')
+        # Supporting multi-class case means that score can be a scalar
+        # or a vector.  Processing this is left up to the user.
+        answers[key] = eval_example[_LM_SCORE_KEY]
+
+    # Construct (scoring output, seqio target) lists by joining on enum ID
+    targets_list = []
+    scores_list = []
+    verbose_entries_idx = 0
+    for k in targets:
+      if k not in answers:
+        raise ValueError(
+            f'Example not found in eval output (key={k}): {targets[k]}')
+      score = answers[k]
+      example = targets[k]
+      target_post = self.mixture_or_task.postprocess_fn(
+          score, example=example, is_target=True)
+      targets_list.append(target_post)
+      scores_list.append(score)
+      if verbose_entries_idx < verbose_entries:
+        logging.info(
+            'inputs_pretokenized=%s\ntargets_pretokenized=%s\n'
+            'is_correct=%s\ntarget=%s\nscore=%s\n\n',
+            example.get('inputs_pretokenized', 'None'),
+            example.get('targets_pretokenized', 'None'),
+            example.get('is_correct', 'N/A'), target_post, score)
+        verbose_entries_idx += 1
+
+    return scores_list, targets_list
+
+  def compute_metrics(
+      self,
+      decoder_outputs: Sequence[Tuple[str, NestedMap]],
+      verbose_entries: Optional[int] = 0,
+      plain_text_output: Optional[TextIO] = None,
+  ) -> Sequence[Mapping[str, Union[seqio.metrics.MetricValue, float]]]:
+    """Computes metrics from the given decoder outputs using predict_metric_fns.
+
+    This method is called only on process=0 after aggregating all outputs as
+    seqio task's metric_fns take in a global view of examples.
+
+    This function basically does the following (for p.use_enumeration=False):
+      1. Iterate through SeqIO task's dataset to construct both (a) the
+        input prefix-based key, and (b) the task.postprocess_fn(ex['targets']),
+        which is the target that is used to compute metrics.
+      2. Iterate through the keys generated in (1) to "left-join" with the
+        decoder_outputs mapping.
+      3. Feed the prefix-key mapped list of decoder_outputs and targets through
+        all task.predict_metric_fns.
+      4. Optionally log a couple entries for inspection.
+      5. Optionally log all entries in text format for inspection.
+
+    When p.use_enumeration=True, we'll match based on enumeration IDs.
+
+    For tasks with score_metric_fns, use compute_metrics_eval() below.
+
+    Arguments:
+      decoder_outputs: a sequence of (str, dict) where the 0-th arg of the tuple
+        is the "prefix key", which is what is used to map between decoder
+        outputs and seqio's target sequences when computing metrics. This is
+        typically just the output of a model's `process_decode_out` method, but
+        can also be read from disk using `io_utils.load_outputs()`.
+      verbose_entries: int, how many entries to log for inspection and sanity
+        checking.
+      plain_text_output: optional output file to write decoder outputs in plain
+        text format for easier inspection
+
+    Returns:
+      The results of predict_metric_fns computed on the decoder outputs.
+      Typically a list of metrics, each element being a mapping from a string
+      metric name to a float.
+    """
+    # TODO(b/236078932): integrate with seqio evaluator.
+    # Current known limitations: assumes LanguageModel decoder output format,
+    # specifically the prediction string has key='decoded_substr'.
+    # Also assumes inputs and targets field names are 'inputs' and 'targets'.
+    p = self.hparams
+    task = self.mixture_or_task
+    if not isinstance(task, seqio.Task):
+      raise ValueError('compute_metrics() is only supported for seqio.Tasks, '
+                       f'got {type(self.mixture_or_task)} for {p.name}.')
+
+    # If there are no seqio decode/predict metrics to compute return empty list
+    if not task.predict_metric_fns:
+      logging.info('no predict_metric_fns defined on task: %s',
+                   self.mixture_or_task.name)
+      return []
+
+    self._validate_compute_metrics_config(raise_exception=True)
+
+    if not decoder_outputs:
+      return []
+    if _LM_DECODER_OUT_KEY not in decoder_outputs[0][1]:
+      logging.warning(
+          ('LanguageModel output format with "%s" key is expected, but '
+           'the key was not found in decoder_outputs (b/244434890)'),
+          _LM_DECODER_OUT_KEY)
+      return []
+
+    answers = dict(decoder_outputs)
+    if p.use_enumeration:
+      (predictions_list,
+       targets_list) = self._build_predict_metric_inputs_with_enum(
+           answers, verbose_entries, plain_text_output)
+    else:
+      (predictions_list,
+       targets_list) = self._build_predict_metric_inputs_with_prefix(
+           answers, verbose_entries, plain_text_output)
+
+    metrics = []
+    for fn in task.predict_metric_fns:
+      m = fn(targets_list, predictions_list)
+      logging.info('Metrics: %s', m)
+      metrics.append(m)
+
+    return metrics
+
+  def compute_metrics_eval(
+      self,
+      eval_outputs: Sequence[Dict[str, py_utils.JTensor]],
+      verbose_entries: int = 0
+  ) -> Sequence[Mapping[str, Union[seqio.metrics.MetricValue, float]]]:
+    """Computes metrics from the given eval outputs using score_metric_fns.
+
+    This method is called only on process=0 after aggregating all outputs as
+    seqio task's metric_fns take in a global view of examples.
+
+    This function basically does the following (for use_enumeration=False):
+      1. Iterate through SeqIO task's dataset to construct both (a) the 'labels'
+        tokens based key, and (b) the task.postprocess_fn(ex['targets']),
+        which is the target that is used to compute metrics.
+      2. Iterate through the keys generated in (1) to "left-join" with the
+        decoder_outputs mapping.
+      3. Feed the prefix-key mapped list of decoder_outputs and targets through
+        all task.predict_metric_fns.
+      4. Optionally log a couple entries for inspection.
+
+    When p.use_enumeration=True, we'll match based on enumeration IDs.
+
+    For tasks with predict_metric_fns, use compute_metrics() above.
+
+    Args:
+      eval_outputs: A list of per_example_outputs. Each element is a nested map
+        from string to JTensor, and is expected to have keys `labels` and
+        `scores`. `labels` is int32 token ids and should be convertible to shape
+        [B, T], and `scores` is float and should be convertible to shape [B],
+        where B is batch size and T is sequence length.
+      verbose_entries: int, how many entries to log for inspection and sanity
+        checking.
+
+    Returns:
+      The results of score_metric_fns computed on the eval outputs.
+      Typically a list of metrics, each element being a mapping from a string
+      metric name to a float.
+    """
+    p = self.hparams
+    task = self.mixture_or_task
+    if not isinstance(task, seqio.Task):
+      raise ValueError(
+          'compute_metrics_eval() is only supported for seqio.Tasks, '
+          f'got {type(self.mixture_or_task)} for {p.name}.')
+    if not task.score_metric_fns:
+      logging.info('no score_metric_fns defined on task: %s',
+                   self.mixture_or_task.name)
+      return []
+
+    self._validate_compute_metrics_config(raise_exception=True)
+
+    if not eval_outputs:
+      return []
+    if _LM_SCORE_KEY not in eval_outputs[0]:
+      logging.warning(
+          ('LanguageModel output format with "%s" key is expected, but '
+           'the key was not found in eval_outputs (b/244434890)'),
+          _LM_SCORE_KEY)
+      return []
+
+    if p.use_enumeration:
+      scores_list, targets_list = self._build_scoring_metric_inputs_with_enum(
+          eval_outputs, verbose_entries)
+    else:
+      scores_list, targets_list = self._build_scoring_metric_inputs_with_labels(
+          eval_outputs, verbose_entries)
 
     metrics = []
     for fn in task.score_metric_fns:
@@ -759,6 +1089,10 @@ class LanguageModelFeatures(seqio.DecoderFeatureConverter):
         use_custom_packing_ops=use_custom_packing_ops,
         apply_length_check=apply_length_check)
 
+  @property
+  def weights_on_targets_only(self) -> bool:
+    return self._weights_on_targets_only
+
   def _to_pax(self, b) -> NestedMap:
     """Change data format for a Pax LanguageModel."""
     b = py_utils.NestedMap.FromNestedDict(b)
@@ -783,12 +1117,12 @@ class LanguageModelFeatures(seqio.DecoderFeatureConverter):
       pos = tf.range(ret.segment_ids.shape[0])
       ret.segment_pos = ret.segment_ids * pos
 
-    if self._weights_on_targets_only is None or self._weights_on_targets_only:
+    if self.weights_on_targets_only is None or self.weights_on_targets_only:
       # Process negative ids, which some datasets use to denote input positions
       # that ought to be ignored.
       non_negative_positions = tf.cast(ret.labels >= 0, dtype=tf.float32)
       ret.weights *= non_negative_positions
-    if self._weights_on_targets_only:
+    if self.weights_on_targets_only:
       non_negative_positions = tf.cast(
           b.decoder_loss_weights > 0, dtype=tf.float32)
       ret.weights *= non_negative_positions
@@ -963,6 +1297,7 @@ def get_eval_hparams_for_seqio(
     split_name: str = 'validation',
     feature_converter: Optional[seqio.FeatureConverter] = None,
     num_infeed_hosts: int = 0,
+    use_enumeration: bool = False,
 ) -> Sequence[SeqIOInput.HParams]:
   """Returns a list of `SeqIOInput.HParams` for SeqIO Task/Mixture for eval.
 
@@ -998,6 +1333,8 @@ def get_eval_hparams_for_seqio(
         ensure that the data is sharded into these many shards. If
         num_infeed_hosts is 0, it will be given a default value by the trainer;
         if it is still not set during __init__, a value of 1 will be used.
+    use_enumeration: whether to use enumeration in both batch generation
+      (get_next()) and metrics computation. For details, see SeqIOInput.HParams.
   """
   if not feature_converter:
     weights_on_targets_only = True if metric_type is MetricType.SCORE else False
@@ -1033,7 +1370,8 @@ def get_eval_hparams_for_seqio(
   tasks = seqio.get_subtasks(seqio.get_mixture_or_task(task_or_mixture_name))
   hparams = []
   for task in tasks:
-    hp = p.clone().set(mixture_name=task.name, name=task.name)
+    hp = p.clone().set(mixture_name=task.name, name=task.name,
+                       use_enumeration=use_enumeration)
     if task.predict_metric_fns and metric_type is MetricType.PREDICT:
       hparams.append(hp)
     if task.score_metric_fns and metric_type is MetricType.SCORE:

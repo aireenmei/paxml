@@ -16,13 +16,24 @@
 """A registry of experiment configurations."""
 import collections
 import functools
-import re
-import sys
-from typing import List, Mapping, Optional
+import importlib
+import traceback
+from typing import Dict, List, Mapping, Optional
+
+from absl import logging
 
 from paxml import base_experiment
 
 BaseExperimentT = base_experiment.BaseExperimentT
+
+
+def _being_reloaded() -> bool:
+  """Returns whether we are being called from importlib.reload."""
+  for s in traceback.extract_stack():
+    if s.name == 'reload' and s.filename == importlib.__file__:
+      # A conservative guess.
+      return True
+  return False
 
 
 class _ExperimentRegistryHelper:
@@ -31,8 +42,17 @@ class _ExperimentRegistryHelper:
   # Global variable for the experiment configuration registry
   # A mapping from a canonical key to the BaseExperimentT class.
   _registry = {}
+  _registry_tags: Dict[str, List[str]] = {}
   # A mapping from a secondary key to all matching canonical keys.
   _secondary_keys = collections.defaultdict(list)
+
+  # If to allow exp param override. This is convenient for colab debugging
+  # where reloading a exp params module would otherwise trigger duplicated
+  # exp registration error.
+  # e.g.
+  # from paxml import experiment_registry
+  # experiment_registry._ExperimentRegistryHelper._allow_overwrite = True
+  _allow_overwrite = False
 
   @classmethod
   def custom_secondary_keys(cls, canonical_key) -> List[str]:
@@ -53,6 +73,7 @@ class _ExperimentRegistryHelper:
   def register(cls,
                experiment_class: Optional[BaseExperimentT] = None,
                *,
+               tags: Optional[List[str]] = None,
                allow_overwrite=False):
     """Registers an experiment configuration class into the global registry.
 
@@ -72,7 +93,10 @@ class _ExperimentRegistryHelper:
 
     Args:
       experiment_class: a BaseExperimentT class.
+      tags: String tags, which can be used to mark experiments as important or
+        unit-testable. Currently we do not prescribe any semantics.
       allow_overwrite: bool, whether re-register an existing class is allowed.
+        It's always set to True when reloading modules.
 
     Returns:
       experiment_class itself, so this can be used as a class decorator, or
@@ -84,19 +108,23 @@ class _ExperimentRegistryHelper:
     """
     if experiment_class is None:
       # decorated with @register(...)
-      return functools.partial(cls.register, allow_overwrite=allow_overwrite)
+      return functools.partial(
+          cls.register, allow_overwrite=allow_overwrite, tags=tags)
+    if _being_reloaded():
+      # Allow overwrite when we're reloading modules. This often happens when
+      # developing in notebooks.
+      allow_overwrite = True
 
     # canonical key is the full path.
     canonical_key = (
         experiment_class.__module__ + '.' + experiment_class.__name__)
     preexisting = canonical_key in cls._registry
-    if preexisting and not allow_overwrite:
+    if preexisting and not (cls._allow_overwrite or allow_overwrite):
       raise ValueError(f'Experiment already registered: {canonical_key}')
     cls._registry[canonical_key] = experiment_class
-    print(
-        'Registered experiment `%s`%s' %
-        (canonical_key, ' (overwritten)' if preexisting else ''),
-        file=sys.stderr)
+    cls._registry_tags[canonical_key] = list(tags or [])
+    logging.info('Registered experiment `%s`%s', canonical_key,
+                 ' (overwritten)' if preexisting else '')
     if preexisting:
       # No need to update secondary keys.
       return experiment_class
@@ -138,19 +166,8 @@ class _ExperimentRegistryHelper:
     return cls._registry.get(canonical_keys[0])
 
   @classmethod
-  def get_docstring_tags(cls, key: str) -> Optional[Mapping[str, str]]:
-    """Retrieves @tags from the class docstring."""
-    params = cls.get(key)
-    if not params:
-      # Note that None means no experiment found, different from an empty map.
-      return None
-    ret = {}
-    for line in params.__doc__.split('\n'):
-      m = re.search(r'@(.*): (.*)', line)
-      if m:
-        tag, value = m.group(1), m.group(2)
-        ret[tag] = value
-    return ret
+  def get_registry_tags(cls, key: str) -> List[str]:
+    return cls._registry_tags.get(key, [])
 
   @classmethod
   def get_all(cls) -> Mapping[str, BaseExperimentT]:
@@ -171,4 +188,4 @@ register = _ExperimentRegistryHelper.register
 get = _ExperimentRegistryHelper.get
 
 get_all = _ExperimentRegistryHelper.get_all
-get_docstring_tags = _ExperimentRegistryHelper.get_docstring_tags
+get_registry_tags = _ExperimentRegistryHelper.get_registry_tags

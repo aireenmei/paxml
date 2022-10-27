@@ -64,9 +64,14 @@ RUN mkdir /bazel && \
     cd / && \
     rm -f /bazel/bazel-$BAZEL_VERSION-installer-linux-x86_64.sh
 
-# Use these commits for testing
 COPY . /paxml
-RUN git clone https://github.com/google/praxis.git
+RUN mkdir /tmp/paxml_pip_package_build/ && \
+  cd paxml && git log | head -n 1 | cut -d' ' -f2 \
+  > /tmp/paxml_pip_package_build/paxml_commit.txt
+
+RUN git clone https://github.com/google/praxis.git && \
+  cd praxis && git log | head -n 1 | cut -d' ' -f2 \
+  > /tmp/paxml_pip_package_build/praxis_commit.txt
 
 RUN cp -r praxis/praxis /paxml/
 
@@ -78,6 +83,8 @@ RUN cd flaxformer && pip3 install .
 
 RUN mv paxml/paxml/pip_package /paxml/
 RUN cd /paxml && bash pip_package/build.sh
+#TODO:enable -praxis/layers:normalizations_test once the new Lingvo pip package is released
+RUN cd praxis && bazel test --test_output=all --test_verbose_timeout_warnings -- praxis/... -praxis/layers:transformer_models_test -praxis/layers:flaxformer_models_test -praxis/layers:ngrammer_test -praxis/layers:attentions_test -praxis/layers:transformers_test -praxis/layers:models_test -praxis/layers:convolutions_test -praxis/layers:embedding_softmax_test -praxis/layers:ctc_objectives_test -praxis/layers:normalizations_test
 RUN cd praxis && bash praxis/pip_package/build_pip_pkg.sh
 
 WORKDIR /

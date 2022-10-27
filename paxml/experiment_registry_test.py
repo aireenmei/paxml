@@ -32,15 +32,6 @@ class DummyExperiment(base_experiment.BaseExperiment):
     return act_p
 
 
-@experiment_registry.register
-class DocstringExp(DummyExperiment):
-  """A docstring.
-
-  @platform: pf_4x4x8
-  @foo_tag: foo_value
-  """
-
-
 @experiment_registry.register()
 class SharedNameExperiment(DummyExperiment):
   pass
@@ -49,6 +40,16 @@ class SharedNameExperiment(DummyExperiment):
 # This tests that explicit re-register works.
 @experiment_registry.register(allow_overwrite=True)
 class SharedNameExperiment(DummyExperiment):  # pylint: disable=function-redefined
+  pass
+
+
+@experiment_registry.register(allow_overwrite=True, tags=['foo_tag'])
+class TaggedA(DummyExperiment):
+  pass
+
+
+@experiment_registry.register(allow_overwrite=True, tags=['foo_tag'])
+class TaggedB(DummyExperiment):
   pass
 
 
@@ -65,17 +66,11 @@ class ExperimentRegistryTest(absltest.TestCase):
 
     self.assertIsNone(experiment_registry.get('DummyExperimentNotDefined'))
 
-  def test_get_docstring_tags(self):
-    tags = experiment_registry.get_docstring_tags('DocstringExp')
-    self.assertEqual(tags, {'foo_tag': 'foo_value', 'platform': 'pf_4x4x8'})
-
   def test_secondary_keys(self):
     classes = set()
+    classes.add(experiment_registry.get('test.synthetic.SyntheticClassifier'))
     classes.add(
-        experiment_registry.get('test.synthetic.SyntheticClassifier'))
-    classes.add(
-        experiment_registry.get(
-            'tasks.test.synthetic.SyntheticClassifier'))
+        experiment_registry.get('tasks.test.synthetic.SyntheticClassifier'))
     classes.add(
         experiment_registry.get(
             'paxml.tasks.test.synthetic.SyntheticClassifier'))
@@ -127,6 +122,15 @@ class ExperimentRegistryTest(absltest.TestCase):
     classes.add(experiment_registry.get('synthetic.SharedNameExperiment'))
     self.assertLen(classes, 2)
     self.assertNotIn(None, classes)
+
+  def test_get_tags(self):
+    collected = []
+    for key in experiment_registry.get_all():
+      tags = experiment_registry.get_registry_tags(key)
+      if 'foo_tag' in tags:
+        collected.append(key)
+        self.assertRegex(key, '.*(TaggedA|TaggedB)')
+    self.assertLen(collected, 2)
 
 
 if __name__ == '__main__':

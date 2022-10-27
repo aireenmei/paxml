@@ -20,7 +20,7 @@ import datetime
 import functools
 import os
 import re
-from typing import Any, Optional, Sequence, Tuple
+from typing import Any, Optional, Sequence, Tuple, Union
 
 from absl import logging
 from etils import epath
@@ -53,23 +53,23 @@ CheckpointType = checkpoint_pb2.CheckpointType
 JTensorOrPartitionSpec = pytypes.JTensorOrPartitionSpec
 PyTreeDef = pytypes.PyTreeDef
 AsyncCheckpointer = orbax.checkpoint.AsyncCheckpointer
+Checkpointer = orbax.checkpoint.Checkpointer
 COMMIT_SUCCESS_FILE = 'commit_success.txt'
 
 
-def is_checkpoint_asset(x: str) -> bool:
+def is_checkpoint_asset(x: epath.Path) -> bool:
   return bool(CHECKPOINT_PATTERN_RE.match(os.path.basename(x)))
 
 
-def _is_tmp_checkpoint_asset(x: str) -> bool:
+def _is_tmp_checkpoint_asset(x: epath.Path) -> bool:
   return bool(TMP_CHECKPOINT_PATTERN_RE.match(os.path.basename(x)))
 
 
-def _is_tmp_checkpoint(directory: str, file: str) -> bool:
+def _is_tmp_checkpoint(directory: epath.Path, file: epath.Path) -> bool:
   """Determines whether the directory/file is a temporary checkpoint."""
   return _is_tmp_checkpoint_asset(file) or (
-      tf.io.gfile.isdir(tf.io.gfile.join(directory, file)) and
-      not orbax.checkpoint.utils.is_checkpoint_finalized(
-          tf.io.gfile.join(directory, file)))
+      (directory / file).is_dir() and
+      not orbax.checkpoint.utils.is_checkpoint_finalized(directory / file))
 
 
 def _to_timestamp(datetime_instance: datetime.datetime) -> int:
@@ -82,31 +82,28 @@ def checkpoint_name(step: int) -> str:
   return f'{CHECKPOINT_PREFIX}{step:08d}'
 
 
-def _make_checkpoint_step_dir(
-    checkpoint_dir: str,
-    step: int,
-) -> str:
-  return os.path.join(checkpoint_dir, checkpoint_name(step))
+def _make_checkpoint_step_dir(checkpoint_dir: epath.Path,
+                              step: int) -> epath.Path:
+  return checkpoint_dir / checkpoint_name(step)
 
 
-def _make_tmp_checkpoint_dir(checkpoint_dir: str,
+def _make_tmp_checkpoint_dir(checkpoint_dir: epath.Path,
                              step: int,
-                             sync_timestamp: bool = False) -> str:
+                             sync_timestamp: bool = False) -> epath.Path:
   timestamp = _to_timestamp(datetime.datetime.utcnow())
   if sync_timestamp:
     timestamp = multihost_utils.broadcast_one_to_all(np.array(timestamp))
     multihost_utils.assert_equal(timestamp,
                                  "Timestamps across hosts don't match.")
   tmp_prefix = f'{TMP_PREFIX}{timestamp}'
-  return os.path.join(checkpoint_dir,
-                      f'{tmp_prefix}.{CHECKPOINT_PREFIX}{step:08d}')
+  return checkpoint_dir / f'{tmp_prefix}.{CHECKPOINT_PREFIX}{step:08d}'
 
 
-def get_step_from_checkpoint_asset(checkpoint_dir: str) -> int:
+def get_step_from_checkpoint_asset(checkpoint_dir: epath.PathLike) -> int:
+  checkpoint_dir = epath.Path(checkpoint_dir)
   if _is_tmp_checkpoint_asset(checkpoint_dir):
-    end_of_tmp = checkpoint_dir.rfind('.')
-    return int(checkpoint_dir[end_of_tmp + 1 + len(CHECKPOINT_PREFIX):])
-  return int(os.path.basename(checkpoint_dir)[len(CHECKPOINT_PREFIX):])
+    return int(checkpoint_dir.suffix[len(CHECKPOINT_PREFIX):])
+  return int(checkpoint_dir.stem[len(CHECKPOINT_PREFIX):])
 
 
 def retrieve_checkpoint_type(
@@ -114,14 +111,13 @@ def retrieve_checkpoint_type(
     task_p: base_task.BaseTask.HParams) -> CheckpointType:
   """Retrieves the CheckpointType given the input arguments."""
   using_pjit = task_p.model.mesh_shape is not None  # pytype: disable=attribute-error
-  if using_pjit:
-    assert jax.config.jax_parallel_functions_output_gda, 'pjit requires GDA'
+  if using_pjit or py_utils.pmap_use_tensorstore():
+    if using_pjit:
+      assert py_utils.gda_or_jax_array(), 'pjit requires GDA or jax.Array'
     if maybe_use_persistence_checkpointing:
       return CheckpointType.CHECKPOINT_PERSISTENCE
     else:
       return CheckpointType.CHECKPOINT_GDA
-  if py_utils.pmap_use_tensorstore():
-    return CheckpointType.CHECKPOINT_GDA
   else:
     # pmap uses CHECKPOINT_FLAX, Persistence-based or not.
     return CheckpointType.CHECKPOINT_FLAX
@@ -129,7 +125,7 @@ def retrieve_checkpoint_type(
 
 def save_checkpoint(
     train_state: train_states.TrainState,
-    checkpoint_dir: str,
+    checkpoint_dir: epath.PathLike,
     overwrite: bool = False,
     checkpoint_type: CheckpointType = CheckpointType.CHECKPOINT_FLAX,
     state_specs: Optional[train_states.TrainState] = None,
@@ -165,6 +161,7 @@ def save_checkpoint(
   """
   del state_specs
 
+  checkpoint_dir = epath.Path(checkpoint_dir)
   step = int(py_utils.maybe_unreplicate_for_fully_replicated(train_state.step))
 
   if checkpoint_type == CheckpointType.CHECKPOINT_GDA:
@@ -180,12 +177,16 @@ def save_checkpoint(
       _save_checkpoint_gda(train_state, checkpoint_dir, overwrite, step,
                            async_ckpt_manager)
   elif checkpoint_type == CheckpointType.CHECKPOINT_FLAX:
-    _save_checkpoint_flax(train_state, checkpoint_dir, overwrite, step)
+    if use_orbax:
+      checkpointer = FlaxCheckpointer()
+      checkpointer.save(checkpoint_dir, train_state, force=overwrite, step=step)
+    else:
+      _save_checkpoint_flax(train_state, checkpoint_dir, overwrite, step)
   else:
     raise ValueError(f'Unexpected checkpoint_type `{checkpoint_type}`.')
 
 
-def latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
+def latest_checkpoint(checkpoint_dir: epath.PathLike) -> Optional[epath.Path]:
   """Gets the path to the latest checkpoint.
 
   Args:
@@ -194,21 +195,23 @@ def latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
   Returns:
     Path to latest checkpoint or None if there is no checkpoint.
   """
-  if not tf.io.gfile.exists(checkpoint_dir):
+  checkpoint_dir = epath.Path(checkpoint_dir)
+  if not checkpoint_dir.exists():
     return None
   # Note: is_checkpoint_asset() already filters out flax temporary checkpoints
   # that would be ending with `tmp`.
   checkpoint_assets = [
-      v for v in tf.io.gfile.listdir(checkpoint_dir) if is_checkpoint_asset(v)
+      v for v in checkpoint_dir.iterdir() if is_checkpoint_asset(v)
   ]
   if not checkpoint_assets:
     return None
   checkpoint_assets = sorted(
       checkpoint_assets, key=get_step_from_checkpoint_asset)
-  return os.path.join(checkpoint_dir, checkpoint_assets[-1])
+  return checkpoint_dir / checkpoint_assets[-1]
 
 
-def retrieve_latest_checkpoint_step(checkpoint_dir: str) -> Optional[int]:
+def retrieve_latest_checkpoint_step(
+    checkpoint_dir: epath.Path) -> Optional[int]:
   """Retrieves the latest checkpoint step if any.
 
   Note that this broadcasts the checkpoint step from host 0 to ensure that all
@@ -220,22 +223,27 @@ def retrieve_latest_checkpoint_step(checkpoint_dir: str) -> Optional[int]:
   Returns:
     The latest checkpoint step as an integer or None if no checkpoint is found.
   """
-  if not tf.io.gfile.exists(checkpoint_dir):
-    return None
-  latest_checkpoint_path = latest_checkpoint(checkpoint_dir)
-  if latest_checkpoint_path is None:
-    return None
-  checkpoint_step = get_step_from_checkpoint_asset(latest_checkpoint_path)
+  if not checkpoint_dir.exists():
+    checkpoint_step = -1
+  else:
+    latest_checkpoint_path = latest_checkpoint(checkpoint_dir)
+    if latest_checkpoint_path is None:
+      checkpoint_step = -1
+    else:
+      checkpoint_step = get_step_from_checkpoint_asset(latest_checkpoint_path)
   np_checkpoint_step = multihost_utils.broadcast_one_to_all(
       np.array(checkpoint_step))
   multihost_utils.assert_equal(np_checkpoint_step,
                                "checkpoint_steps across hosts don't match.")
-  return int(np_checkpoint_step.item())
+  step = int(np_checkpoint_step.item())
+  if step == -1:
+    return None
+  return step
 
 
 def restore_checkpoint(
     state_global_shapes: train_states.TrainState,
-    checkpoint_dir: str,
+    checkpoint_dir: epath.PathLike,
     global_mesh: Optional[maps.Mesh] = None,
     checkpoint_type: CheckpointType = CheckpointType.CHECKPOINT_FLAX,
     state_specs: Optional[train_states.TrainState] = None,
@@ -265,6 +273,7 @@ def restore_checkpoint(
     ValueError: When a mismatch between the current checkpoint structure and
     the saved checkpoint one is detected.
   """
+  checkpoint_dir = epath.Path(checkpoint_dir)
   if checkpoint_type == CheckpointType.CHECKPOINT_GDA:
     if use_orbax:
       if step is None:
@@ -285,19 +294,24 @@ def restore_checkpoint(
       return _restore_checkpoint_gda(state_global_shapes, checkpoint_dir,
                                      global_mesh, state_specs, step)
   elif checkpoint_type == CheckpointType.CHECKPOINT_FLAX:
-    return _restore_checkpoint_flax(state_global_shapes, checkpoint_dir, step)
+    if use_orbax:
+      checkpointer = FlaxCheckpointer()
+      return checkpointer.restore(
+          checkpoint_dir, item=state_global_shapes, step=step)
+    else:
+      return _restore_checkpoint_flax(state_global_shapes, checkpoint_dir, step)
   else:
     raise ValueError(f'Unexpected checkpoint_type `{checkpoint_type}`.')
 
 
 def _save_checkpoint_flax(train_state: train_states.TrainState,
-                          checkpoint_dir: str, overwrite: bool,
+                          checkpoint_dir: epath.Path, overwrite: bool,
                           step: int) -> None:
   """Saves a checkpoint using Flax serialization mechanism."""
   if not overwrite:
     previous_filename = latest_checkpoint(checkpoint_dir)
     if previous_filename:
-      previous_step = int(previous_filename.rsplit('_', 1)[-1])
+      previous_step = int(str(previous_filename).rsplit('_', 1)[-1])
       if previous_step >= step:
         logging.warning(
             'A more recent checkpoint `%d` has already been saved compared '
@@ -327,7 +341,7 @@ def _save_checkpoint_flax(train_state: train_states.TrainState,
 
 def _restore_checkpoint_flax(
     state_global_shapes: train_states.TrainState,
-    checkpoint_dir: str,
+    checkpoint_dir: epath.Path,
     step: Optional[int] = None) -> Optional[train_states.TrainState]:
   """Restores a checkpoint using Flax serialization mechanism."""
   # Input the same data structure as in save_checkpoint().
@@ -395,22 +409,22 @@ def _mkdir_path(name: str, tmp_dir: str) -> str:
   return path
 
 
-def delete_temp_directories(checkpoint_dir: str, overwrite: bool = False):
+def delete_temp_directories(checkpoint_dir: epath.Path,
+                            overwrite: bool = False):
   """Deletes temporary checkpoint directories saved by GDA."""
-  if not overwrite and tf.io.gfile.exists(checkpoint_dir):
+  if not overwrite and checkpoint_dir.exists():
     # Does not contain directory path, only dirname is returned.
-    checkpoint_dirnames = tf.io.gfile.listdir(checkpoint_dir)
     # Delete tmp directories if any.
     if jax.process_index() == 0:
       tmp_checkpoint_dirnames = [
-          x for x in checkpoint_dirnames
+          x for x in checkpoint_dir.iterdir()
           if _is_tmp_checkpoint(checkpoint_dir, x)
       ]
       if tmp_checkpoint_dirnames:
         logging.warn('Found incompletely saved checkpoints %s; deleting them',
                      tmp_checkpoint_dirnames)
         for x in tmp_checkpoint_dirnames:
-          tf.io.gfile.rmtree(os.path.join(checkpoint_dir, x))
+          (checkpoint_dir / x).rmtree()
     # Note we must barrier across all processes after the tmp directory
     # delete.
     py_utils.sync_global_devices('Wait for checkpoint tmp dir deletions to '
@@ -563,24 +577,60 @@ class PaxCheckpointHandler(orbax.checkpoint.PyTreeCheckpointHandler):
     return restored_train_state
 
   def structure(self, directory: epath.Path) -> PyTreeDef:
-    return flax.serialization.to_state_dict(
-        jax.tree_map(epath.Path, self._param_names))
+    return flax.serialization.to_state_dict(self._param_names)
 
 
-def on_commit_callback(temp_ckpt_dir, final_ckpt_dir):
+class FlaxCheckpointer(orbax.checkpoint.AbstractCheckpointer):
+  """Thin Orbax-compatible wrapper around flax_checkpoints.
+
+  Since Flax-checkpoint support in Pax will eventually be deprecated, we do not
+  plan to provide a more well-integrated interface.
+  """
+
+  def save(self,
+           directory: Union[str, epath.Path],
+           item: Any,
+           force: bool = False,
+           step: Optional[int] = None):
+    if not py_utils.pmap_use_tensorstore() and jax.process_index() != 0:
+      return
+    if not isinstance(directory, str):
+      directory = os.fspath(directory)
+
+    if step is None:
+      raise ValueError('Required argument `step` for `FlaxCheckpointer.save`')
+    _save_checkpoint_flax(item, directory, force, step)
+
+  def restore(self,
+              directory: Union[str, epath.Path],
+              *args: Any,
+              item: Optional[Any] = None,
+              step: Optional[int] = None) -> Any:
+    if not isinstance(directory, str):
+      directory = os.fspath(directory)
+    if item is None:
+      raise ValueError(
+          'Required argument `item` for `FlaxCheckpointer.restore`')
+    return _restore_checkpoint_flax(item, directory, step=step)
+
+  def structure(self, directory: Union[str, epath.Path]) -> Optional[Any]:
+    return NotImplementedError
+
+
+def on_commit_callback(temp_ckpt_dir: epath.Path, final_ckpt_dir: epath.Path):
   if temp_ckpt_dir == final_ckpt_dir:
-    with tf.io.gfile.GFile(
-        os.path.join(final_ckpt_dir, COMMIT_SUCCESS_FILE), 'w') as f:
-      f.write(f'Checkpoint commit was successful to {final_ckpt_dir}')
+    success_file = final_ckpt_dir / COMMIT_SUCCESS_FILE
+    success_file.write_text(
+        f'Checkpoint commit was successful to {final_ckpt_dir}')
   else:
     logging.info('Renaming %s to %s', temp_ckpt_dir, final_ckpt_dir)
-    tf.io.gfile.rename(temp_ckpt_dir, final_ckpt_dir)
+    temp_ckpt_dir.rename(final_ckpt_dir)
     logging.info('Finished saving checkpoint to `%s`.', final_ckpt_dir)
 
 
 def _save_checkpoint_gda(
     train_state: train_states.TrainState,
-    checkpoint_dir: str,
+    checkpoint_dir: epath.PathLike,
     overwrite: bool,
     step: int,
     async_ckpt_manager: Optional[
@@ -601,11 +651,8 @@ def _save_checkpoint_gda(
       serialization and deserialization of GDA arrays. This manager allows
       training to continue when checkpointing is going on as checkpointing
       happens in a different thread.
-    use_orbax: Use Orbax for checkpointing.
-    async_checkpointer: When async checkpointing and Orbax are enabled, allows
-      training to continue when checkpointing is going on as checkpointing
-      happens in a different thread.
   """
+  checkpoint_dir = epath.Path(checkpoint_dir)
   if not overwrite:
     checkpoint_dirnames = tf.io.gfile.listdir(checkpoint_dir)
     sorted_dirnames = sorted(
@@ -625,7 +672,7 @@ def _save_checkpoint_gda(
   # checkpoint directory as the temporary checkpoint directory. This is because
   # renames are not atomic on GCS. When restoring check for the existence of a
   # success file.
-  if checkpoint_step_dir.startswith('gs://'):
+  if checkpoint_step_dir.as_uri().startswith('gs://'):
     checkpoint_step_tmp_dir = checkpoint_step_dir
   else:
     checkpoint_step_tmp_dir = _make_tmp_checkpoint_dir(
@@ -639,7 +686,7 @@ def _save_checkpoint_gda(
 
   if jax.process_index() == 0:
     # Create the tmp parent dir.
-    tf.io.gfile.makedirs(checkpoint_step_tmp_dir)
+    checkpoint_step_tmp_dir.mkdir(parents=True, exist_ok=True)
 
   with futures.ThreadPoolExecutor() as executor:
     ckpt_paths = list(
@@ -660,14 +707,15 @@ def _save_checkpoint_gda(
     logging.info('Started GDA asynchrounous checkpoint.')
   else:
     gda_serialization.run_serialization(flattened_train_state, tspecs)
-    # Note we must barrier across all processes before the directory rename.
-    py_utils.sync_global_devices('Wait for checkpoint chunk writes to '
-                                 f'{checkpoint_step_tmp_dir} to finish.')
-    if jax.process_index() == 0:
-      # Rename temporary checkpoint directory to its final location.
-      logging.info('Renaming %s to %s', checkpoint_step_tmp_dir,
-                   checkpoint_step_dir)
-      tf.io.gfile.rename(checkpoint_step_tmp_dir, checkpoint_step_dir)
+    if checkpoint_step_tmp_dir != checkpoint_step_dir:
+      # Note we must barrier across all processes before the directory rename.
+      py_utils.sync_global_devices('Wait for checkpoint chunk writes to '
+                                   f'{checkpoint_step_tmp_dir} to finish.')
+      if jax.process_index() == 0:
+        # Rename temporary checkpoint directory to its final location.
+        logging.info('Renaming %s to %s', checkpoint_step_tmp_dir,
+                     checkpoint_step_dir)
+        tf.io.gfile.rename(checkpoint_step_tmp_dir, checkpoint_step_dir)
     py_utils.sync_global_devices(
         f'Finished saving GDA checkpoint for step {step} to {checkpoint_step_dir}'
     )
@@ -677,13 +725,12 @@ def _save_checkpoint_gda(
 
 def _restore_checkpoint_gda(
     state_global_shapes: train_states.TrainState,
-    checkpoint_dir: str,
+    checkpoint_dir: epath.Path,
     global_mesh: Optional[maps.Mesh],
     state_specs: Optional[train_states.TrainState],
     step: Optional[int] = None) -> Optional[train_states.TrainState]:
   """Restores a checkpoint using JAX GDA deserialization mechanism."""
-  if not tf.io.gfile.exists(checkpoint_dir) or not tf.io.gfile.listdir(
-      checkpoint_dir):
+  if not checkpoint_dir.exists() or not list(checkpoint_dir.iterdir()):
     if step is None:
       logging.info(
           'GDA checkpoint restore did not find checkpoint_dir %s; '
@@ -693,7 +740,7 @@ def _restore_checkpoint_gda(
         f'No checkpoint found for restore in {checkpoint_dir}')
 
   if step is None:
-    checkpoint_dirnames = tf.io.gfile.listdir(checkpoint_dir)
+    checkpoint_dirnames = list(checkpoint_dir.iterdir())
     tmp_checkpoint_dirnames = [
         x for x in checkpoint_dirnames if _is_tmp_checkpoint(checkpoint_dir, x)
     ]
@@ -703,8 +750,7 @@ def _restore_checkpoint_gda(
     sorted_dirnames = sorted(
         [x for x in checkpoint_dirnames if is_checkpoint_asset(x)])
     if not sorted_dirnames:
-      logging.info(
-          f'No checkpoint found for restore in {checkpoint_dir}')
+      logging.info('No checkpoint found for restore in %r', checkpoint_dir)
       return None
     latest_checkpoint_dirname = sorted_dirnames[-1]
     step = get_step_from_checkpoint_asset(latest_checkpoint_dirname)
@@ -712,13 +758,13 @@ def _restore_checkpoint_gda(
     logging.info('Found latest checkpoint: %s', checkpoint_step_dir)
   else:
     checkpoint_step_dir = _make_checkpoint_step_dir(checkpoint_dir, step)
-    if not tf.io.gfile.exists(checkpoint_step_dir) or not tf.io.gfile.listdir(
-        checkpoint_step_dir):
+    if not checkpoint_step_dir.exists() or not list(
+        checkpoint_step_dir.iterdir()):
       raise FileNotFoundError(
           f'No checkpoint found for restore in {checkpoint_step_dir}')
 
-  if (checkpoint_step_dir.startswith('gs://') and not tf.io.gfile.exists(
-      os.path.join(checkpoint_step_dir, COMMIT_SUCCESS_FILE))):
+  if checkpoint_step_dir.as_uri().startswith('gs://') and not (
+      checkpoint_step_dir / COMMIT_SUCCESS_FILE).exists():
     raise ValueError('The checkpoint save failed since the commit_success.txt '
                      "file doesn't exist hence restore cannot be done as the "
                      'checkpoints saved are probably corrupted.')
@@ -731,6 +777,8 @@ def _restore_checkpoint_gda(
   # MaskedNode's.
 
   flattened_global_shapes = jax.tree_map(lambda x: x.shape,
+                                         flattened_train_state)
+  flattened_global_dtypes = jax.tree_map(lambda x: x.dtype,
                                          flattened_train_state)
 
   ckpt_paths = [
@@ -745,10 +793,14 @@ def _restore_checkpoint_gda(
   logging.info('GDA checkpoint restore tspecs: %s', tspecs)
   logging.info('GDA checkpoint restore partition_spec_leaves: %s',
                flattened_state_specs)
+
+  shardings = [py_utils.cached_mesh_pspec_sharding(global_mesh, s)
+               for s in flattened_state_specs]
   train_state_gda = gda_serialization.run_deserialization(
-      [global_mesh] * len(tspecs),
-      flattened_state_specs,
+      shardings,
       tspecs,
+      concurrent_gb=96,
+      dtypes=flattened_global_dtypes,
       global_shapes=flattened_global_shapes)
 
   # We add back the MaskedNode entries into the pytree.
