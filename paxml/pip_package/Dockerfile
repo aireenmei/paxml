@@ -13,34 +13,6 @@ ENV WHEEL_FOLDER $wheel_folder
 ENV PYTHON_VERSION="3"
 ENV PYTHON_MINOR_VERSION="8"
 
-# Pick up some TF dependencies
-RUN apt update && DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends software-properties-common
-RUN apt update && DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
-        aria2 \
-        build-essential \
-        curl \
-        dirmngr \
-        emacs \
-        git \
-        gpg-agent \
-        less \
-        libfreetype6-dev \
-        libhdf5-serial-dev \
-        libpng-dev \
-        libzmq3-dev \
-        lsof \
-        pkg-config \
-        rename \
-        rsync \
-        python-dev \
-        python3-distutils \
-        sox \
-        unzip \
-        vim \
-        && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
-
 # Install python 3.8
 RUN add-apt-repository ppa:deadsnakes/ppa && \
     apt-get update && apt-get install -y \
@@ -55,6 +27,54 @@ RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.8 0
 # Install pip package
 RUN pip3 install pip-tools
 
+# Pick up some TF dependencies
+RUN apt update && DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends software-properties-common
+RUN apt update && DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
+        build-essential \
+        curl \
+        git \
+        pkg-config \
+        rename \
+        rsync \
+        python3-pip \
+        unzip \
+        vim \
+        && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY . /paxml
+
+RUN mkdir -p $WHEEL_FOLDER && cd paxml && \
+  git rev-parse HEAD > $WHEEL_FOLDER/paxml_commit.txt
+
+RUN git clone -b test_20221110 https://github.com/aireenmei/praxis.git && \
+  cd praxis && git rev-parse HEAD > $WHEEL_FOLDER/praxis_commit.txt
+
+RUN cp -r praxis/praxis /paxml/
+
+RUN cd /paxml/praxis/pip_package && \
+    pip-compile requirements.in \
+    --output-file $WHEEL_FOLDER/praxis_requirements.txt
+
+RUN diff -a /paxml/praxis/pip_package/requirements.txt \
+    -b $WHEEL_FOLDER/praxis_requirements.txt > \
+    $WHEEL_FOLDER/praxis_requirements_diff.txt
+
+RUN cd /paxml/praxis/pip_package && \
+    pip-compile requirements.in \
+    --output-file $WHEEL_FOLDER/paxml_requirements.txt
+
+RUN diff -a /paxml/paxml/pip_package/requirements.txt \
+    -b $WHEEL_FOLDER/paxml_requirements.txt > \
+    $WHEEL_FOLDER/paxml_requirements_diff.txt
+
+RUN pip3 install -r paxml/paxml/pip_package/requirements.txt
+
+RUN git clone https://github.com/google/flaxformer.git
+RUN cd flaxformer && pip3 install .
+
+
 ARG bazel_version=5.1.1
 # This is to install bazel, for development purposes.
 ENV BAZEL_VERSION ${bazel_version}
@@ -67,35 +87,7 @@ RUN mkdir /bazel && \
     cd / && \
     rm -f /bazel/bazel-$BAZEL_VERSION-installer-linux-x86_64.sh
 
-COPY . /paxml
 
-RUN mkdir -p $WHEEL_FOLDER && cd paxml && \
-  git rev-parse HEAD > $WHEEL_FOLDER/paxml_commit.txt
-
-RUN git clone -b test_20221110 https://github.com/aireenmei/praxis.git && \
-  cd praxis && git rev-parse HEAD > $WHEEL_FOLDER/praxis_commit.txt
-
-RUN cp -r praxis/praxis /paxml/
-
-RUN pip-compile /paxml/praxis/pip_package/requirements.in \
-    --output-file $WHEEL_FOLDER/praxis_requirements.txt
-
-# RUN diff -a /paxml/praxis/pip_package/requirements.txt \
-#     -b $WHEEL_FOLDER/praxis_requirements.txt > \
-#     $WHEEL_FOLDER/praxis_requirements_diff.txt
-
-RUN pip-compile --quiet /paxml/praxis/pip_package/requirements.in \
-    /paxml/paxml/pip_package/requirements.in \
-    --output-file $WHEEL_FOLDER/paxml_requirements.txt
-
-# RUN diff -a /paxml/paxml/pip_package/requirements.txt \
-#     -b $WHEEL_FOLDER/paxml_requirements.txt > \
-#     $WHEEL_FOLDER/paxml_requirements_diff.txt
-
-RUN pip3 install -r paxml/paxml/pip_package/requirements.txt
-
-RUN git clone https://github.com/google/flaxformer.git
-RUN cd flaxformer && pip3 install .
 
 RUN mv paxml/paxml/pip_package /paxml/
 RUN cd /paxml && bash pip_package/build.sh
