@@ -13,20 +13,6 @@ ENV WHEEL_FOLDER $wheel_folder
 ENV PYTHON_VERSION="3"
 ENV PYTHON_MINOR_VERSION="8"
 
-# Install python 3.8
-RUN add-apt-repository ppa:deadsnakes/ppa && \
-    apt-get update && apt-get install -y \
-    python3.8 python3.8-dev python3-pip python3.8-venv && \
-    rm -rf /var/lib/apt/lists/* && \
-    python3.8 -m pip install pip --upgrade && \
-    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.8 0
-
-# Make python3.8 the default python version
-RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.8 0
-
-# Install pip package
-RUN pip3 install pip-tools
-
 # Pick up some TF dependencies
 RUN apt update && DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends software-properties-common
 RUN apt update && DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
@@ -42,6 +28,20 @@ RUN apt update && DEBIAN_FRONTEND=noninteractive apt install -y --no-install-rec
         && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
+
+# Install python 3.8
+RUN add-apt-repository ppa:deadsnakes/ppa && \
+    apt-get update && apt-get install -y \
+    python3.8 python3.8-dev python3-pip python3.8-venv && \
+    rm -rf /var/lib/apt/lists/* && \
+    python3.8 -m pip install pip --upgrade && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.8 0
+
+# Make python3.8 the default python version
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.8 0
+
+# Install pip package
+RUN pip3 install pip-tools
 
 COPY . /paxml
 
