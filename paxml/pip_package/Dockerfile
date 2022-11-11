@@ -69,7 +69,7 @@ RUN mkdir /bazel && \
 
 COPY . /paxml
 
-RUN mkdir $WHEEL_FOLDER && cd paxml && \
+RUN mkdir -p $WHEEL_FOLDER && cd paxml && \
   git rev-parse HEAD > $WHEEL_FOLDER/paxml_commit.txt
 
 RUN git clone https://github.com/google/praxis.git && \
