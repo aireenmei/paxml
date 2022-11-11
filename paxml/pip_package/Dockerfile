@@ -53,13 +53,15 @@ RUN git clone -b test_20221110 https://github.com/aireenmei/praxis.git && \
 
 RUN cp -r praxis/praxis /paxml/
 
-RUN cd /paxml/praxis/pip_package && \
-    pip-compile requirements.in \
-    --output-file $WHEEL_FOLDER/praxis_requirements.txt
+RUN "diff /paxml/paxml/pip_package/cloudbuild-presubmit.yaml \
+    /paxml/paxml/pip_package/cloudbuild-postsubmit.yaml"
+# RUN cd /paxml/praxis/pip_package && \
+#     pip-compile requirements.in \
+#     --output-file $WHEEL_FOLDER/praxis_requirements.txt
 
-RUN ["/bin/bash", "-c", "\"diff /paxml/praxis/pip_package/requirements.txt \
-    ${WHEEL_FOLDER}/praxis_requirements.txt > \
-    ${WHEEL_FOLDER}/praxis_requirements_diff.txt\""]
+# RUN ["/bin/bash", "-c", "\"diff /paxml/praxis/pip_package/requirements.txt \
+#     ${WHEEL_FOLDER}/praxis_requirements.txt > \
+#     ${WHEEL_FOLDER}/praxis_requirements_diff.txt\""]
 
 RUN "diff /paxml/praxis/pip_package/requirements.txt \
     ${WHEEL_FOLDER}/praxis_requirements.txt > \
@@ -69,9 +71,9 @@ RUN cd /paxml/praxis/pip_package && \
     pip-compile requirements.in \
     --output-file $WHEEL_FOLDER/paxml_requirements.txt
 
-RUN ["/bin/bash", "-c", "\"diff /paxml/paxml/pip_package/requirements.txt \
-    ${WHEEL_FOLDER}/paxml_requirements.txt > \
-    ${WHEEL_FOLDER}/paxml_requirements_diff.txt\""]
+# RUN ["/bin/bash", "-c", "\"diff /paxml/paxml/pip_package/requirements.txt \
+#     ${WHEEL_FOLDER}/paxml_requirements.txt > \
+#     ${WHEEL_FOLDER}/paxml_requirements_diff.txt\""]
 
 RUN pip3 install -r paxml/paxml/pip_package/requirements.txt
 
