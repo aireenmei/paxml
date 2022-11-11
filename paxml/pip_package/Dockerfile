@@ -80,16 +80,17 @@ RUN cp -r praxis/praxis /paxml/
 RUN pip-compile /paxml/praxis/pip_package/requirements.in \
     --output-file $WHEEL_FOLDER/praxis_requirements.txt
 
-RUN diff -a /paxml/praxis/pip_package/requirements.txt \
-    -b $WHEEL_FOLDER/praxis_requirements.txt > \
-    $WHEEL_FOLDER/praxis_requirements_diff.txt
+# RUN diff -a /paxml/praxis/pip_package/requirements.txt \
+#     -b $WHEEL_FOLDER/praxis_requirements.txt > \
+#     $WHEEL_FOLDER/praxis_requirements_diff.txt
 
 RUN pip-compile --quiet /paxml/praxis/pip_package/requirements.in \
     /paxml/paxml/pip_package/requirements.in \
-    --output-file $WHEEL_FOLDER/paxml_requirements.txt && \
-    diff -a /paxml/paxml/pip_package/requirements.txt \
-    -b $WHEEL_FOLDER/paxml_requirements.txt > \
-    $WHEEL_FOLDER/paxml_requirements_diff.txt
+    --output-file $WHEEL_FOLDER/paxml_requirements.txt
+
+# RUN diff -a /paxml/paxml/pip_package/requirements.txt \
+#     -b $WHEEL_FOLDER/paxml_requirements.txt > \
+#     $WHEEL_FOLDER/paxml_requirements_diff.txt
 
 RUN pip3 install -r paxml/paxml/pip_package/requirements.txt
 
