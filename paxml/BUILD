@@ -270,6 +270,7 @@ pytype_strict_library(
         # Implicit fiddle.absl_flags dependency.
         # Implicit jax dependency.
         # Implicit jax.experimental.gda_serialization dependency.
+        "//praxis:pax_fiddle",
         "//praxis:py_utils",
         # Implicit pyglove dependency.
     ],
@@ -436,7 +437,6 @@ pytype_strict_library(
         "//praxis:base_layer",
         "//praxis:py_utils",
         "//praxis:pytypes",
-        "//praxis:train_states",
         # Implicit tensorflow_no_contrib dependency.
     ],
 )
@@ -462,7 +462,6 @@ pytype_strict_library(
         "//praxis:pytypes",
         "//praxis:sgf",
         "//praxis:train_states",
-        # Implicit tensorflow_no_contrib dependency.
     ],
 )
 

@@ -48,6 +48,7 @@ from paxml import tasks_lib
 from paxml import train
 from paxml import trainer_lib
 from paxml import tuning_lib
+from praxis import pax_fiddle
 from praxis import py_utils
 import pyglove as pg
 
@@ -250,7 +251,7 @@ def run_experiment(
           async_checkpointer = AsyncPersistenceCheckpointer(timeout_secs=600)
         else:
           async_checkpointer = checkpoints.AsyncCheckpointer(
-              checkpoints.PaxCheckpointHandler(enable_flax=False),
+              checkpoints.PaxCheckpointHandler(enable_aggregation=False),
               timeout_secs=600)
       else:
         if FLAGS.maybe_use_persistence_checkpointing:
@@ -411,7 +412,7 @@ def main(argv: Sequence[str]) -> None:
   else:
     cfg = absl_flags.create_buildable_from_flags(
         module=None, allow_imports=True)
-    experiment_config = fdl.build(cfg)
+    experiment_config = pax_fiddle.build(cfg)
 
   experiment_config.validate()
   run(experiment_config=experiment_config,

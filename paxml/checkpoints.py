@@ -171,7 +171,7 @@ def save_checkpoint(
         async_checkpointer.save(checkpoint_step_dir, train_state)
       else:
         checkpointer = orbax.checkpoint.Checkpointer(
-            PaxCheckpointHandler(enable_flax=False))
+            PaxCheckpointHandler(enable_aggregation=False))
         checkpointer.save(checkpoint_step_dir, train_state)
     else:
       _save_checkpoint_gda(train_state, checkpoint_dir, overwrite, step,
@@ -283,7 +283,7 @@ def restore_checkpoint(
           return None
       checkpoint_step_dir = _make_checkpoint_step_dir(checkpoint_dir, step)
       checkpointer = orbax.checkpoint.Checkpointer(
-          PaxCheckpointHandler(enable_flax=False))
+          PaxCheckpointHandler(enable_aggregation=False))
       restored_train_state = checkpointer.restore(
           checkpoint_step_dir,
           item=state_global_shapes,
@@ -353,7 +353,7 @@ def _restore_checkpoint_flax(
       'str_pytree_state': str_pytree_state,
   }
   restored_target = flax_checkpoints.restore_checkpoint(
-      checkpoint_dir, input_target, step=step)
+      os.fspath(checkpoint_dir), input_target, step=step)
   # Flax restore_checkpoint returned input_target unchanged if
   # no step specified and no checkpoint files present.
   if restored_target is input_target:
@@ -560,7 +560,7 @@ class PaxCheckpointHandler(orbax.checkpoint.PyTreeCheckpointHandler):
     self._set_param_names(flattened_nested_names)
 
     def create_restore_args(pspec, shape_struct):
-      return orbax.checkpoint.RestoreArgs(
+      return orbax.checkpoint.ArrayRestoreArgs(
           mesh=mesh, mesh_axes=pspec, global_shape=shape_struct.shape)
 
     restore_args = jax.tree_map(create_restore_args, flattened_state_specs,
@@ -588,32 +588,28 @@ class FlaxCheckpointer(orbax.checkpoint.AbstractCheckpointer):
   """
 
   def save(self,
-           directory: Union[str, epath.Path],
+           directory: epath.PathLike,
            item: Any,
            force: bool = False,
            step: Optional[int] = None):
     if not py_utils.pmap_use_tensorstore() and jax.process_index() != 0:
       return
-    if not isinstance(directory, str):
-      directory = os.fspath(directory)
 
     if step is None:
       raise ValueError('Required argument `step` for `FlaxCheckpointer.save`')
-    _save_checkpoint_flax(item, directory, force, step)
+    _save_checkpoint_flax(item, epath.Path(directory), force, step)
 
   def restore(self,
-              directory: Union[str, epath.Path],
+              directory: epath.PathLike,
               *args: Any,
               item: Optional[Any] = None,
               step: Optional[int] = None) -> Any:
-    if not isinstance(directory, str):
-      directory = os.fspath(directory)
     if item is None:
       raise ValueError(
           'Required argument `item` for `FlaxCheckpointer.restore`')
-    return _restore_checkpoint_flax(item, directory, step=step)
+    return _restore_checkpoint_flax(item, epath.Path(directory), step=step)
 
-  def structure(self, directory: Union[str, epath.Path]) -> Optional[Any]:
+  def structure(self, directory: epath.PathLike) -> Optional[Any]:
     return NotImplementedError
 
 
@@ -654,9 +650,8 @@ def _save_checkpoint_gda(
   """
   checkpoint_dir = epath.Path(checkpoint_dir)
   if not overwrite:
-    checkpoint_dirnames = tf.io.gfile.listdir(checkpoint_dir)
     sorted_dirnames = sorted(
-        [x for x in checkpoint_dirnames if is_checkpoint_asset(x)])
+        [x for x in checkpoint_dir.iterdir() if is_checkpoint_asset(x)])
     if sorted_dirnames:
       latest_checkpoint_dirname = sorted_dirnames[-1]
       previous_step = get_step_from_checkpoint_asset(latest_checkpoint_dirname)

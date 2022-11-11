@@ -22,7 +22,7 @@ import enum
 import io
 import os
 import typing
-from typing import Any, Dict, List, Mapping, Optional, Sequence, TextIO, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, TextIO, Tuple, Union
 
 from absl import logging
 import jax
@@ -114,6 +114,16 @@ def _convert_bytes_to_str(tree: Any) -> Any:
     return leaf.decode('utf-8')
 
   return jax.tree_map(_convert_fn, tree)
+
+
+def _select_split(
+    task: str,
+    split_name: Union[str, Callable[[str], str]],
+) -> str:
+  """Returns a split name given a split selector (Callable) or str literal."""
+  if callable(split_name):
+    return split_name(task)
+  return split_name
 
 
 def should_process_outputs(inp: base_input.BaseInput) -> bool:
@@ -574,6 +584,16 @@ class SeqIOInput(base_input.BaseInput):
         seed=p.input_random_seed,
         use_cached=p.use_cached,
         trim_output_features=p.trim_output_features)
+
+    # customized input may contain ragged tensor, which may cause errors in
+    # decoding when calling 'as_numpy_iterator()' below. We filter out
+    # RaggedTensor here.
+    ds_non_ragged_element_keys = []
+    for ds_element_key, ds_element_value in targets_ds.element_spec.items():
+      if not isinstance(ds_element_value, tf.RaggedTensorSpec):
+        ds_non_ragged_element_keys.append(ds_element_key)
+    targets_ds = targets_ds.map(
+        lambda x: {i: x[i] for i in ds_non_ragged_element_keys})
 
     # Note that lists are used per prefix since there may be duplicates
     targets = collections.defaultdict(list)
@@ -1167,8 +1187,10 @@ class SequenceModelFeatures(seqio.EncDecFeatureConverter):
   LanguageModelFeatures above.
   """
 
-  def __init__(self, pack: bool = False) -> None:
-    super().__init__(pack=pack, use_custom_packing_ops=False)
+  def __init__(self,
+               pack: bool = False,
+               use_custom_packing_ops: bool = False) -> None:
+    super().__init__(pack=pack, use_custom_packing_ops=use_custom_packing_ops)
 
   def _to_pax(self, b) -> NestedMap:
     """Change data format for a Pax SequenceModel."""
@@ -1282,6 +1304,15 @@ class RemoveProvenance(seqio.PassThroughFeatureConverter):
     return ds
 
 
+class UnflattenAndRemoveProvenance(RemoveProvenance):
+  """Un-flattens and removes provenance fields added by Deterministic tasks."""
+
+  def __call__(self, ds: tf.data.Dataset,
+               task_feature_lengths: Mapping[str, int]) -> tf.data.Dataset:
+    ds = ds.map(seqio.unflatten_dict)
+    return super().__call__(ds, task_feature_lengths)
+
+
 class MetricType(enum.Enum):
   """SeqIO metric types."""
   PREDICT = 1  # decoding-based metrics
@@ -1294,11 +1325,12 @@ def get_eval_hparams_for_seqio(
     feature_lengths: Mapping[str, int],
     seed: int,
     metric_type: MetricType,
-    split_name: str = 'validation',
+    split_name: Union[str, Callable[[str], str]] = 'validation',
     feature_converter: Optional[seqio.FeatureConverter] = None,
     num_infeed_hosts: int = 0,
     use_enumeration: bool = False,
-) -> Sequence[SeqIOInput.HParams]:
+    use_cached: bool = False,
+) -> list[SeqIOInput.HParams]:
   """Returns a list of `SeqIOInput.HParams` for SeqIO Task/Mixture for eval.
 
   This is the easiest way to configure eval hparams in datasets() (for scoring
@@ -1326,7 +1358,10 @@ def get_eval_hparams_for_seqio(
       prompts selected.
     metric_type: The type of metrics to return hparams for. Configure PREDICT
       type in decoder_datasets() and SCORE type in datasets().
-    split_name: The split to use for evaluation, defaults to 'validation'.
+    split_name: The split to use for evaluation, defaults to 'validation'. This
+      may optionally be a callable that takes a str task name (i.e. a member
+      of the provided mixture) and returns the name of the split to use for each
+      task.
     feature_converter: The SeqIO FeatureConverter to use to transform data,
       defaults to seqio_input.LanguageModelFeatures with packing disabled
     num_infeed_hosts: Usually set to jax.process_count(). Implementation must
@@ -1335,6 +1370,7 @@ def get_eval_hparams_for_seqio(
         if it is still not set during __init__, a value of 1 will be used.
     use_enumeration: whether to use enumeration in both batch generation
       (get_next()) and metrics computation. For details, see SeqIOInput.HParams.
+    use_cached: whether to use cached data.
   """
   if not feature_converter:
     weights_on_targets_only = True if metric_type is MetricType.SCORE else False
@@ -1343,7 +1379,6 @@ def get_eval_hparams_for_seqio(
   p = SeqIOInput.HParams(
       name=task_or_mixture_name,
       mixture_name=task_or_mixture_name,
-      split_name=split_name,
       feature_converter=feature_converter,
       is_training=False,
       eval_loop_num_batches=None,
@@ -1367,11 +1402,17 @@ def get_eval_hparams_for_seqio(
   }
 
   # Split hparams per tasks and filter by metric type.
-  tasks = seqio.get_subtasks(seqio.get_mixture_or_task(task_or_mixture_name))
+  tasks: Sequence[seqio.Task] = seqio.get_subtasks(
+      seqio.get_mixture_or_task(task_or_mixture_name))
   hparams = []
   for task in tasks:
     hp = p.clone().set(mixture_name=task.name, name=task.name,
-                       use_enumeration=use_enumeration)
+                       use_enumeration=use_enumeration,
+                       use_cached=use_cached)
+    # Allow selecting split based on `Callable` `split_name` if mixture contains
+    # tasks with varying splits.
+    hp.split_name = _select_split(task.name, split_name)
+    assert isinstance(hp.split_name, str)
     if task.predict_metric_fns and metric_type is MetricType.PREDICT:
       hparams.append(hp)
     if task.score_metric_fns and metric_type is MetricType.SCORE:

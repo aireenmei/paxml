@@ -127,9 +127,15 @@ def restore_pmap_from_tensorstore(global_shapes,
   if global_mesh is not None:
     return fully_replicated_gda_model_states
   if checkpoint_type == CheckpointType.CHECKPOINT_PERSISTENCE:
-    fully_replicated_sda_model_states = jax.tree_map(
-        py_utils.convert_fully_replicated_gda_to_sda,
-        fully_replicated_gda_model_states)
+    if jax.config.jax_array:
+      fully_replicated_array_model_states = jax.tree_map(
+          py_utils.convert_fully_replicated_array_to_pmap_array,
+          fully_replicated_gda_model_states)
+      return fully_replicated_array_model_states
+    else:
+      fully_replicated_sda_model_states = jax.tree_map(
+          py_utils.convert_fully_replicated_gda_to_sda,
+          fully_replicated_gda_model_states)
     return fully_replicated_sda_model_states
   # model_states is GDA or jax.Array; we convert back to DA or jax.Array with
   # single device sharding for pmap.
@@ -208,7 +214,7 @@ class CheckpointLoadingRules(NamedTuple):
     load_opt_states: whether to load opt_states (in its entirety) from this
       checkpoint.
     input_specs_provider_p: A `BaseInputSpecsProvider.HParams` used to provide
-      input specs information for model initialization.
+      input specs information for the pre-trained model initialization.
   """
   task_p: SingleTask.HParams
   load_rules: Sequence[Tuple[RegexStr, str]]
@@ -303,6 +309,8 @@ class SingleTask(base_task.BaseTask):
         this value is not a positive int. Set to 0 to disable decode steps.
       decode_start_after_n_steps: Starts decoder after N steps, only used in
         continuous decoding.
+      decode_use_ema_state: If True, use ema states to run decode during train,
+        note that in this case ema MUST be enabled in the learner.
       profiler_num_steps: The number of steps to be captured by the profiler
         based on the step time estimate.
       profiler_min_duration_sec: The minimum duration to be captured by the
@@ -332,10 +340,12 @@ class SingleTask(base_task.BaseTask):
         str, CheckpointLoadingRules] = dataclasses.field(default_factory=dict)
     decode_interval_steps: Optional[int] = None
     decode_start_after_n_steps: int = 0
+    # TODO(zhishuai): verify this for a pjit model.
+    decode_use_ema_state: bool = False
     profiler_num_steps: int = 2
     profiler_min_duration_sec: float = 1.
     profiler_capture_step: Optional[int] = None
-    always_use_train_for_model_init: bool = False
+    always_use_train_for_model_init: bool = True
 
   @enum.unique
   class TrackDecoderMetricMode(str, enum.Enum):
@@ -359,8 +369,14 @@ class SingleTask(base_task.BaseTask):
       track_decoder_metric_min_or_max: track min or max metric value.
       infer_writer: specifies how to generate and write some output with a model
       use_orbax: if True, enables checkpointing with Orbax.
+      fold_decode_prng_key_per_batch: if True, folds the decode prng key per
+        decoding batch index. Only effective for pmap decoding.
     """
-    model: Optional[base_model.BaseModel.HParams] = None
+    # TODO(b/249483164) Change this to just `= sub_config_field(None)` after
+    # Fiddle migration is complete.
+    model: Optional[base_model.BaseModel.HParams] = (
+        None if issubclass(base_model.BaseModel, base_layer.BaseLayer) else
+        sub_config_field(None))
 
     # Implementation note: `SingleTask` is not defined in the interpreter
     # context here, so we need to wrap it in a lambda which will look it up from
@@ -376,6 +392,7 @@ class SingleTask(base_task.BaseTask):
         SingleTask.TrackDecoderMetricMode] = None
     infer_writer: Optional[SingleTask.InferWriterHParams] = None
     use_orbax: bool = False
+    fold_decode_prng_key_per_batch: bool = False
 
   def __init__(self, hparams: SingleTask.HParams) -> None:
     super().__init__(hparams)

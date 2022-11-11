@@ -8,6 +8,7 @@ LABEL maintainer="Pax team <pax-dev@google.com>"
 # instruction after a FROM.
 ARG cpu_base_image="ubuntu:20.04"
 ARG base_image=$cpu_base_image
+ARG praxis_version
 ARG wheel_folder
 ENV WHEEL_FOLDER $wheel_folder
 ENV PYTHON_VERSION="3"
@@ -52,9 +53,6 @@ RUN add-apt-repository ppa:deadsnakes/ppa && \
 # Make python3.8 the default python version
 RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.8 0
 
-# Install pip package
-RUN pip3 install pip-tools
-
 ARG bazel_version=5.1.1
 # This is to install bazel, for development purposes.
 ENV BAZEL_VERSION ${bazel_version}
@@ -68,54 +66,19 @@ RUN mkdir /bazel && \
     rm -f /bazel/bazel-$BAZEL_VERSION-installer-linux-x86_64.sh
 
 COPY . /paxml
-
-RUN mkdir $WHEEL_FOLDER && cd paxml && \
-  git rev-parse HEAD > $WHEEL_FOLDER/paxml_commit.txt
-
-RUN git clone https://github.com/google/praxis.git && \
-  cd praxis && git rev-parse HEAD > $WHEEL_FOLDER/praxis_commit.txt
+RUN mkdir $WHEEL_FOLDER
+RUN git clone -b r${praxis_version} https://github.com/google/praxis.git
 
 RUN cp -r praxis/praxis /paxml/
 
-RUN pip-compile --quiet /paxml/praxis/pip_package/requirements.in \
-    --output-file $WHEEL_FOLDER/praxis_requirements.txt && \
-    diff -a /paxml/praxis/pip_package/requirements.txt \
-    -b $WHEEL_FOLDER/praxis_requirements.txt > \
-    $WHEEL_FOLDER/praxis_requirements_diff.txt
-
-RUN pip-compile --quiet /paxml/praxis/pip_package/requirements.in \
-    /paxml/paxml/pip_package/requirements.in \
-    --output-file $WHEEL_FOLDER/paxml_requirements.txt && \
-    diff -a /paxml/paxml/pip_package/requirements.txt \
-    -b $WHEEL_FOLDER/paxml_requirements.txt > \
-    $WHEEL_FOLDER/paxml_requirements_diff.txt
-
-RUN pip3 install -r paxml/paxml/pip_package/requirements.txt
+RUN pip3 install paxml/praxis/pip_package
+RUN pip3 install paxml/paxml/pip_package
 
 RUN git clone https://github.com/google/flaxformer.git
 RUN cd flaxformer && pip3 install .
 
 RUN mv paxml/paxml/pip_package /paxml/
 RUN cd /paxml && bash pip_package/build.sh
-#TODO:enable -praxis/layers:normalizations_test once the new Lingvo pip package is released
-RUN cd praxis && \
-  bazel test \
-  --test_output=all \
-  --test_verbose_timeout_warnings \
-  -- \
-  praxis/... \
-  -praxis/layers:attentions_test \
-  -praxis/layers:convolutions_test \
-  -praxis/layers:ctc_objectives_test \
-  -praxis/layers:embedding_softmax_test \
-  -praxis/layers:flaxformer_models_test \
-  -praxis/layers:models_test \
-  -praxis/layers:ngrammer_test \
-  -praxis/layers:normalizations_test \
-  -praxis/layers:transformer_models_test \
-  -praxis/layers:transformers_test
-
-RUN cd praxis && bash praxis/pip_package/build_pip_pkg.sh
 
 WORKDIR /
 

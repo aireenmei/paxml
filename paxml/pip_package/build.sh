@@ -26,6 +26,7 @@ set -e -x
 export PYTHON_VERSION="${PYTHON_VERSION:-3}"
 export PYTHON_MINOR_VERSION="${PYTHON_MINOR_VERSION}"
 export PIP_MANYLINUX2010="${PIP_MANYLINUX2010:-1}"
+export DST_DIR="${WHEEL_FOLDER:-/tmp/wheels}"
 
 if [[ -z "${PYTHON_MINOR_VERSION}" ]]; then
   PYTHON="python${PYTHON_VERSION}"
@@ -73,8 +74,7 @@ write_action_env_to_bazelrc "TF_NEED_CUDA" ${TF_NEED_CUDA}
 
 bazel clean
 bazel build ...
-bazel test paxml/... --test_output=all --test_verbose_timeout_warnings
+bazel test  --test_output=all --test_verbose_timeout_warnings   --  paxml/... -paxml/tasks/vision:input_generator_test
 
-DST_DIR="/tmp/paxml_pip_package_build"
 ./pip_package/build_pip_pkg.sh "$DST_DIR" ${PYTHON_VERSION}
 pip3 freeze > "${DST_DIR}/dependencies.txt"
