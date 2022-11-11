@@ -57,17 +57,17 @@ RUN cd /paxml/praxis/pip_package && \
     pip-compile requirements.in \
     --output-file $WHEEL_FOLDER/praxis_requirements.txt
 
-RUN diff -a /paxml/praxis/pip_package/requirements.txt \
+RUN bash -c "diff -a /paxml/praxis/pip_package/requirements.txt \
     -b $WHEEL_FOLDER/praxis_requirements.txt > \
-    $WHEEL_FOLDER/praxis_requirements_diff.txt
+    $WHEEL_FOLDER/praxis_requirements_diff.txt"
 
 RUN cd /paxml/praxis/pip_package && \
     pip-compile requirements.in \
     --output-file $WHEEL_FOLDER/paxml_requirements.txt
 
-RUN diff -a /paxml/paxml/pip_package/requirements.txt \
+RUN bash -c "diff -a /paxml/paxml/pip_package/requirements.txt \
     -b $WHEEL_FOLDER/paxml_requirements.txt > \
-    $WHEEL_FOLDER/paxml_requirements_diff.txt
+    $WHEEL_FOLDER/paxml_requirements_diff.txt"
 
 RUN pip3 install -r paxml/paxml/pip_package/requirements.txt
 
