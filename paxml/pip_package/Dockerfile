@@ -77,9 +77,10 @@ RUN git clone https://github.com/google/praxis.git && \
 
 RUN cp -r praxis/praxis /paxml/
 
-RUN pip-compile --quiet /paxml/praxis/pip_package/requirements.in \
-    --output-file $WHEEL_FOLDER/praxis_requirements.txt && \
-    diff -a /paxml/praxis/pip_package/requirements.txt \
+RUN pip-compile /paxml/praxis/pip_package/requirements.in \
+    --output-file $WHEEL_FOLDER/praxis_requirements.txt
+
+RUN diff -a /paxml/praxis/pip_package/requirements.txt \
     -b $WHEEL_FOLDER/praxis_requirements.txt > \
     $WHEEL_FOLDER/praxis_requirements_diff.txt
 
