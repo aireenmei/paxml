@@ -18,7 +18,7 @@
 import dataclasses
 import enum
 import functools
-from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Optional, Protocol, Sequence, TYPE_CHECKING, Tuple, Union
 
 from absl import logging
 from etils import epath
@@ -52,8 +52,10 @@ NestedShape = NestedMap
 PRNGKey = pytypes.PRNGKey
 ParamsT = pytypes.HParamsT
 PyTreeDef = pytypes.PyTreeDef
+NestedPartitionSpec = pytypes.NestedPartitionSpec
 NestedShapeDtypeStruct = pytypes.NestedShapeDtypeStruct
 NestedShapeDtypeLike = pytypes.NestedShapeDtypeLike
+NestedPartitionSpec = pytypes.NestedPartitionSpec
 NestedWeightHParams = base_layer.NestedWeightHParams
 TrainState = train_states.TrainState
 SummaryDict = pytypes.SummaryDict
@@ -115,7 +117,7 @@ class RunningMode(enum.Flag):
     return bool(self & RunningMode.DECODE)
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class TrainStateMetadata:
   """Metadata around the TrainState.
 
@@ -129,10 +131,10 @@ class TrainStateMetadata:
   partitioned_specs: Optional[TrainState] = None
 
 
-def create_train_state_metadata(
-    jax_task: tasks_lib.SingleTask,
-    train_shape_dtype: NestedShapeDtypeLike,
-    discard_opt_states: bool = False) -> TrainStateMetadata:
+def create_train_state_metadata(jax_task: tasks_lib.SingleTask,
+                                train_shape_dtype: NestedShapeDtypeLike,
+                                discard_opt_states: bool = False,
+                                do_eval: bool = False) -> TrainStateMetadata:
   """Creates a TrainStateMetadata instance.
 
   Args:
@@ -142,12 +144,13 @@ def create_train_state_metadata(
       for pmap models and global shapes for pjit ones.
     discard_opt_states: Whether to discard the part corresponding to the
       optimizer states or not.
+    do_eval: Whether this metadata is used for evaluation.
 
   Returns:
     A TrainStateMetadata instance.
   """
   var_weight_hparams = jax_task.model.abstract_init_with_metadata(
-      train_shape_dtype)
+      train_shape_dtype, do_eval=do_eval)
   padded_global_shapes = jax_task.create_train_state_padded_shapes(
       var_weight_hparams, discard_opt_states=discard_opt_states)
   unpadded_global_shapes = jax_task.create_train_state_unpadded_shapes(
@@ -271,10 +274,13 @@ def adjust_input_params_for_small_batch(
     copy.batch_padding_size = local_device_count - batch_size
 
   assert inp_p.num_infeed_hosts <= jax.process_count()
+  # LINT.IfChange(PspecSharding)
   if jax.process_count() == 1:
     # If there is only one host, valid examples are already contiguous so we can
     # use default GDA creation.
+    # Inputs use pspec sharding (see praxis.BaseInput.reshard_for_spmd).
     return copy
+  # LINT.ThenChange(trainer_lib.py:UsePspecOnArrayInputs)
   # Some hosts may produce duplicate data, but they will be discarded.
   copy.infeed_host_index = jax.process_index() % inp_p.num_infeed_hosts
   if copy.infeed_host_index >= inp_p.num_infeed_hosts:
@@ -304,12 +310,15 @@ def adjust_input_params_for_small_batch(
   return copy
 
 
-def initialize_model_state(jax_task: tasks_lib.SingleTask,
-                           prng_key: PRNGKey,
-                           inputs_shape_dtype: NestedShapeDtypeLike,
-                           discard_opt_states: bool = False,
-                           do_init_checkpoint_rules: bool = True,
-                           is_eval: bool = False) -> TrainState:
+def initialize_model_state(
+    jax_task: tasks_lib.SingleTask,
+    prng_key: PRNGKey,
+    inputs_shape_dtype: NestedShapeDtypeLike,
+    discard_opt_states: bool = False,
+    do_init_checkpoint_rules: bool = True,
+    is_eval: bool = False,
+    checkpoint_type: CheckpointType = CheckpointType.CHECKPOINT_UNSPECIFIED
+) -> TrainState:
   """Initializes the model states.
 
   Weights are random initialized first.
@@ -325,6 +334,8 @@ def initialize_model_state(jax_task: tasks_lib.SingleTask,
     do_init_checkpoint_rules: Whether to apply init checkpoint rules or not.
     is_eval: whether to initialize in under eval context. Only used under the
       legacy model initialization flow.
+    checkpoint_type: The checkpoint type to use when restoring weights based on
+      the init_checkpoint_rules.
 
   Returns:
     TrainStates - training states.
@@ -365,10 +376,11 @@ def initialize_model_state(jax_task: tasks_lib.SingleTask,
                                             discard_opt_states)
   # `do_init_checkpoint_rules` is False for pjit/spmd.
   if do_init_checkpoint_rules:
-    if py_utils.pmap_use_tensorstore():
-      checkpoint_type = CheckpointType.CHECKPOINT_GDA
-    else:
-      checkpoint_type = CheckpointType.CHECKPOINT_FLAX
+    if checkpoint_type == CheckpointType.CHECKPOINT_UNSPECIFIED:
+      if py_utils.pmap_use_tensorstore():
+        checkpoint_type = CheckpointType.CHECKPOINT_GDA
+      else:
+        checkpoint_type = CheckpointType.CHECKPOINT_FLAX
     # Overwrite some parts if init_checkpoint_rules are set (warm-start)
     # Note that this assumes a pmap model with Flax checkpoint(s).
     train_state, update_opt_states = jax_task.apply_init_checkpoint_rules(
@@ -886,7 +898,8 @@ def decode_step(
     prng_key: JTensor,
     var_weight_hparams: NestedWeightHParams,
     inputs: Union[JTensor, NestedMap],
-    fprop_dtype: jnp.dtype = jnp.float32
+    fprop_dtype: jnp.dtype = jnp.float32,
+    prng_key_fold_with_global_step: bool = True
 ) -> Tuple[Tuple[Any, Any, Any], NestedMap]:
   """Decodes a model for a single step.
 
@@ -897,15 +910,18 @@ def decode_step(
     var_weight_hparams: A pytree of WeightHParams for the model variables.
     inputs: A batch of inputs to model.decode().
     fprop_dtype: fprop datatype, can be either jnp.float32 or jnp.bfloat16.
+    prng_key_fold_with_global_step: Boolean to decide whether to fold the
+      prng_key with the global step.
 
   Returns:
     A tuple of (weighted_scalars, results, eval_metrics) as computed
       by model.decode() and the updated weights.
   """
   context_p = base_layer.JaxContext.HParams(do_eval=True, summary_verbosity=2)
-  # Fold in global_step as part of the random seed key, so that random
-  # numbers depends on global step.
-  prng_key = jax.random.fold_in(prng_key, states.step)
+  if prng_key_fold_with_global_step:
+    # Fold in global_step as part of the random seed key, so that random
+    # numbers depends on global step.
+    prng_key = jax.random.fold_in(prng_key, states.step)
   mdl_vars = states.mdl_vars
 
   assert not states.opt_states
@@ -1119,6 +1135,14 @@ def infer_partition_spec_based_on_rank_fn(
     return base_layer.to_partition_spec(mapping_dict[key], mesh_names)
 
 
+def get_input_shape_dtypes(
+    input_p: base_input.BaseInput.HParams
+) -> Tuple[NestedShapeDtypeLike, NestedShapeDtypeLike]:
+  sample_inputs = instantiate(input_p).get_next_padded()
+  return jax.tree_map(
+      py_utils.get_global_input_shape_dtype, sample_inputs)
+
+
 def get_input_partition_specs(mesh_axis_names, inputs_shape_dtype):
   # Compute inputs PartitionSpec from inputs_shape_dtype
   inputs_partition_spec_fn = functools.partial(
@@ -1230,7 +1254,8 @@ class _SpmdModelPartitioner:
       self._init_shape_dtype = train_inputs_shape_dtype
       self._abstract_init_with_train = True
 
-  def partition(self, step_fn, is_eval):
+  def partition(self, step_fn, is_eval) -> Tuple[
+      Callable[..., Any], NestedPartitionSpec, TrainState]:
     """Gets a sharded (pjit-ed) step function of the SPMD Model.
 
     Args:
@@ -1443,8 +1468,16 @@ class _SpmdModelPartitioner:
                                      list(fn_out_partition_specs[1:]))
 
     asserts.assert_same_structure(fn_out_partition_specs, out_padded_shapes)
-    partitioned_step_fn = self._pjit(step_fn, is_eval, fn_in_partition_specs,
-                                     fn_out_partition_specs)
+
+    # LINT.IfChange(UsePspecOnArrayInputs)
+    use_pspec_on_array_inputs = (jax.process_count() == 1)
+    # LINT.ThenChange(trainer_lib.py:PspecSharding)
+    partitioned_step_fn = self._pjit(
+        step_fn,
+        is_eval,
+        fn_in_partition_specs,
+        fn_out_partition_specs,
+        use_pspec_on_array_inputs=use_pspec_on_array_inputs)
     logging.info('step_fn inputs_partition_spec=%s', input_partition_spec)
     return (partitioned_step_fn, input_partition_spec,
             train_state_partition_spec)
@@ -1459,7 +1492,8 @@ def get_partitioned_spmd_model_step_fn(
     train_inputs_shape_dtype: Optional[NestedShapeDtypeLike] = None,
     train_state_partition_spec: Optional[TrainState] = None,
     unpadded_global_batch_size: Optional[int] = None,
-    enable_auto_sharding: bool = False):
+    enable_auto_sharding: bool = False) -> Tuple[Any, NestedPartitionSpec,
+                                                 TrainState]:
   """Return sharded train/eval/decode step function of the SPMD Model.
 
   Args:
@@ -1524,6 +1558,7 @@ def get_partitioned_spmd_model_step_fn(
   if enable_auto_sharding:
     sharding_info = None
   else:
+    assert train_state_partition_spec is not None
     sharding_info = _SpmdModelPartitioner.ShardingInfo(
         train_state_partition_spec, unpadded_global_batch_size)
 
@@ -1532,6 +1567,84 @@ def get_partitioned_spmd_model_step_fn(
                                       train_inputs_shape_dtype, sharding_info,
                                       auto_sharding_replicate_output)
   return partitioner.partition(step_fn, is_eval)
+
+
+def get_spmd_model_step_fns_from_inputs(
+    input_ps: Sequence[base_input.BaseInput.HParams],
+    unpadded_input_ps: Sequence[base_input.BaseInput.HParams],
+    jax_task: tasks_lib.SingleTask,
+    mode: RunningMode,
+    global_mesh: maps.Mesh,
+    init_key: PRNGKey,
+    train_inputs_shape_dtype: Optional[NestedShapeDtypeLike] = None,
+    train_state_partition_spec: Optional[TrainState] = None,
+    enable_auto_sharding: bool = False) -> Tuple[
+        Sequence[Callable[..., Any]], Sequence[NestedPartitionSpec],
+        Sequence[NestedShapeDtypeStruct], TrainState]:
+  """Helper for calling `get_partitioned_spmd_model_step_fn` with input_ps.
+
+  Note: This method instantiates all the input pipelines passed in `input_ps` to
+    get a sample input.
+
+  Args:
+    input_ps: inputs hparams list. May be padded unliked `unpadded_input_ps`.
+    unpadded_input_ps: inputs hparams list. Importantly these are inputs
+      *before* being called by `adjust_input_params_for_small_batch`. Thus,
+      `py_utils.get_global_batch_size(p)` returns the unpadded batch size.
+    jax_task: see docstring for `get_partitioned_spmd_model_step_fn`.
+    mode: see docstring for `get_partitioned_spmd_model_step_fn`.
+    global_mesh: see docstring for `get_partitioned_spmd_model_step_fn`.
+    init_key: see docstring for `get_partitioned_spmd_model_step_fn`.
+    train_inputs_shape_dtype: see docstring for
+      `get_partitioned_spmd_model_step_fn`.
+    train_state_partition_spec: see docstring for
+      `get_partitioned_spmd_model_step_fn`.
+    enable_auto_sharding: see docstring for
+      `get_partitioned_spmd_model_step_fn`.
+
+  Returns:
+    (step_fns, input_partition_specs, inputs_shape_dtypes,
+     train_state_partition_spec):
+    The partitioned step function and the partition spec for the inputs,
+    train state, and train_state_partition_spec. If auto-sharding is enabled,
+    train_state_partition_spec is automatically generated, otherwise it's the
+    same as the provided one.
+  """
+  if len(input_ps) != len(unpadded_input_ps):
+    raise ValueError(
+        'Length of padded and unpadded inputs must match and be 1-to-1: '
+        f'{len(input_ps)} != {len(unpadded_input_ps)}.')
+
+  step_fns = []
+  input_partition_specs = []
+  inputs_shape_dtypes = []
+  updated_train_state_partition_spec = train_state_partition_spec
+
+  for input_p, unpadded_input_p in zip(input_ps, unpadded_input_ps):
+    # TODO(pax-dev): Investigate if we can use model input specs
+    # instead of instantiating this input pipeline.
+    inputs_shape_dtype = get_input_shape_dtypes(input_p)
+    # TODO(pax-dev): Here it assumes all updated_train_state_partition_spec are
+    # the same, verify that.
+    step_fn, inputs_partition_spec, updated_train_state_partition_spec = (
+        get_partitioned_spmd_model_step_fn(
+            jax_task,
+            mode,
+            global_mesh,
+            init_key,
+            inputs_shape_dtype,
+            train_inputs_shape_dtype=train_inputs_shape_dtype,
+            train_state_partition_spec=train_state_partition_spec,
+            unpadded_global_batch_size=(
+                unpadded_input_p.cls.get_global_batch_size(unpadded_input_p)),
+            enable_auto_sharding=enable_auto_sharding))
+
+    inputs_shape_dtypes.append(inputs_shape_dtype)
+    step_fns.append(step_fn)
+    input_partition_specs.append(inputs_partition_spec)
+
+  return (step_fns, input_partition_specs, inputs_shape_dtypes,
+          updated_train_state_partition_spec)
 
 
 def check_unique_names(inputs: Sequence[base_input.BaseInput]) -> None:
@@ -1556,3 +1669,91 @@ def bind_mesh(pjitted_fn, global_mesh: maps.Mesh):
 
   call.lower = lower
   return call
+
+
+class SingleTaskPjitTrainer:
+  """Trainer that assumes a single taks on a single dataset."""
+
+  def __init__(self,
+               task: tasks_lib.SingleTask,
+               train_input: base_input.BaseInput,
+               mesh: maps.Mesh,
+               enable_auto_sharding: bool = False):
+    self._task = task
+    self._train_input = train_input
+    self._mesh = mesh
+    self._enable_auto_sharding = enable_auto_sharding
+    self._train_unpadded_global_batch_size = (
+        train_input.HParams.cls.get_batch_size(train_input.hparams) *
+        train_input.hparams.num_infeed_hosts)
+    # Has to initialize before train_state_metadata as the inputs_shape_dtype
+    # requires self._sample_inputs.
+    self._sample_inputs = train_input.get_next_padded()
+    self._train_state_metadata = create_train_state_metadata(
+        self._task, self.inputs_shape_dtype)
+    # Lazily initialized values after calling `initialize`.
+    self._step_fn = None
+    self._train_input_pipeline = None
+    self._input_pspecs = None
+    self._train_state_partition_spec = None
+
+  def compile_step(
+      self, prng_key: jax.random.KeyArray
+  ) -> Tuple[Any, NestedPartitionSpec, TrainState]:
+    """Compiles a partitioned step_fn under pjit.
+
+    Args:
+      prng_key: The jax random key to use for initializing model variables.
+
+    Returns:
+      A tuple of (partitioned step function, partitioned input spec,
+        partitioned train state specs).
+    """
+    if self._step_fn is None:
+      self._step_fn, self._input_pspecs, self._train_state_partition_spec = (
+          get_partitioned_spmd_model_step_fn(
+              self._task,
+              RunningMode.TRAIN,
+              self._mesh,
+              prng_key,
+              inputs_shape_dtype=self.inputs_shape_dtype,
+              train_state_partition_spec=(
+                  self._train_state_metadata.partitioned_specs),
+              unpadded_global_batch_size=self._train_unpadded_global_batch_size,
+              enable_auto_sharding=self._enable_auto_sharding))
+    return self._step_fn, self._input_pspecs, self._train_state_partition_spec
+
+  def train_step(self, state: TrainState, prng_key: jax.random.KeyArray,
+                 inputs: Any):
+    if self._step_fn is None:
+      # Compile and get the step_fn.
+      # NOTE: The compilation turns of auto sharding so the partition_spec is
+      # not modified upon returning.
+      self.compile_step(prng_key)
+    return self._step_fn(state, prng_key, inputs)
+
+  @property
+  def train_state_metadata(self) -> TrainStateMetadata:
+    return self._train_state_metadata
+
+  @property
+  def train_unpadded_global_batch_size(self) -> int:
+    return self._train_unpadded_global_batch_size
+
+  @property
+  def task(self) -> tasks_lib.SingleTask:
+    if self._task is None:
+      raise ValueError(
+          'initialize() method must be called before using Trainer.')
+    return self._task
+
+  @property
+  def inputs_shape_dtype(self) -> NestedShapeDtypeLike:
+    return jax.tree_map(py_utils.get_global_input_shape_dtype,
+                        self._sample_inputs)
+
+  @property
+  def perhost_inputs_shape_dtype(self) -> NestedShapeDtypeLike:
+    return jax.tree_map(
+        lambda x: jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype),
+        self._sample_inputs)

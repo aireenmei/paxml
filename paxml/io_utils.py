@@ -18,6 +18,7 @@
 import collections
 import concurrent
 import contextlib
+import dataclasses
 import enum
 import json
 import os
@@ -181,12 +182,16 @@ class JnpEncoder(json.JSONEncoder):
       return float(o)
     elif isinstance(o, np.ndarray):
       return o.tolist()
-
-    return super().default(o)
+    elif isinstance(o, bytes):
+      return o.decode('utf-8')
+    elif dataclasses.is_dataclass(o):
+      return dataclasses.asdict(o)
+    else:
+      return super().default(o)
 
 
 def write_key_value_pairs(filename: epath.PathLike,
-                          key_value_pairs: Sequence[Tuple[str, Any]],
+                          key_value_pairs: Sequence[Tuple[Optional[str], Any]],
                           cast_to_ndarray: bool = True,
                           write_pickle: bool = True) -> None:
   """Writes `key_value_pairs` to pkl and jsonl files."""

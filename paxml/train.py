@@ -17,22 +17,23 @@
 
 import abc
 import contextlib
+import dataclasses
 import datetime
 import functools
 import json
 import re
 import time
 import typing
-from typing import Any, Dict, Optional, Sequence, Tuple, Union, Type
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union, Type
 
 from absl import logging
 from clu import platform
 from etils import epath
 from flax.core import frozen_dict
 import jax
+from jax import monitoring
 from jax.experimental import maps
 from jax.experimental import pjit
-from jax.experimental.gda_serialization import serialization as gda_serialization
 from paxml import base_experiment
 from paxml import checkpoint_managers
 from paxml import checkpoint_pb2
@@ -53,20 +54,23 @@ import tensorflow.compat.v2 as tf
 from paxml import checkpoints  # mapped to internal
 from paxml import profiling  # mapped to internal
 
-CheckpointType = checkpoint_pb2.CheckpointType
-instantiate = base_hyperparams.instantiate
-PMAP_PARALLEL_AXIS_NAME = base_layer.PMAP_PARALLEL_AXIS_NAME
-NON_PAX_RNG_KEY = base_layer.NON_PAX_RNG_KEY
-PARAMS = base_layer.PARAMS
-NestedShapeDtypeLike = pytypes.NestedShapeDtypeLike
-SummaryWriter = tf.summary.SummaryWriter
+Checkpointer = checkpoints.Checkpointer
 CheckpointManager = Union[checkpoint_managers.CheckpointManager,
                           checkpoint_managers.OrbaxCheckpointManager]
-Checkpointer = checkpoints.Checkpointer
+CheckpointType = checkpoint_pb2.CheckpointType
+instantiate = base_hyperparams.instantiate
+NestedShapeDtypeLike = pytypes.NestedShapeDtypeLike
 PaxCheckpointHandler = checkpoints.PaxCheckpointHandler
+RunningMode = trainer_lib.RunningMode
+SummaryWriter = tf.summary.SummaryWriter
 
+PARAMS = base_layer.PARAMS
+NON_PAX_RNG_KEY = base_layer.NON_PAX_RNG_KEY
+PMAP_PARALLEL_AXIS_NAME = base_layer.PMAP_PARALLEL_AXIS_NAME
 _N_STEPS_WARMUP_LOGGING = 5
 
+_READ_CHECKPOINT_EVENT: str = '/jax/checkpoint/read/durations_sec'
+_WRITE_CHECKPOINT_EVENT: str = '/jax/checkpoint/write/durations_sec'
 
 def _checkpoint_dir(job_log_dir: epath.Path) -> epath.Path:
   """Returns the checkpoint directory from the root `job_log_dir`."""
@@ -143,86 +147,6 @@ class _TrainingCheckpointer(metaclass=abc.ABCMeta):
     raise NotImplementedError
 
 
-class _PjitTrainingCheckpointer(_TrainingCheckpointer):
-
-  def __init__(self,
-               checkpoint_manager: checkpoint_managers.CheckpointManager,
-               checkpoint_type,
-               async_ckpt_manager,
-               async_checkpointer,
-               job_log_dir: epath.Path,
-               enable_checkpoint_saving: bool = True):
-    self.checkpoint_dir = _make_checkpoint_dir(job_log_dir)
-    checkpoints.delete_temp_directories(self.checkpoint_dir)
-    self.async_ckpt_manager = async_ckpt_manager
-    self.async_checkpointer = async_checkpointer
-
-    self._checkpoint_type = checkpoint_type
-    self.multi_host_checkpointing = checkpoint_type == CheckpointType.CHECKPOINT_GDA
-    self.checkpoint_manager = checkpoint_manager
-    self._enable_checkpoint_saving = enable_checkpoint_saving
-
-  def _save(self,
-            step_i,
-            partitioned_train_state,
-            train_state_pspecs,
-            is_final=False):
-    if not self._enable_checkpoint_saving:
-      return
-
-    logging.info('Saving a ckpt at %sstep: %d', 'final ' if is_final else '',
-                 step_i)
-    py_utils.sync_global_devices(
-        f'checkpointer:saving:{self.checkpoint_dir}:step-{step_i}')
-    checkpoints.save_checkpoint(
-        partitioned_train_state,
-        self.checkpoint_dir,
-        checkpoint_type=self._checkpoint_type,
-        state_specs=train_state_pspecs,
-        async_ckpt_manager=self.async_ckpt_manager,
-        use_orbax=False,
-        async_checkpointer=self.async_checkpointer)
-    self.checkpoint_manager.save_metadata(global_step_id=step_i, force=is_final)
-    py_utils.sync_global_devices(
-        f'checkpointer:saved:{self.checkpoint_dir}:step-{step_i}')
-
-  def save_if_needed(self, step_i, partitioned_train_state, train_state_pspecs):
-    if self.checkpoint_manager.should_save(step_i):
-      self._save(
-          step_i, partitioned_train_state, train_state_pspecs, is_final=False)
-
-    if self.async_ckpt_manager is not None:
-      # Since the checkpoint is happening asynchronously, the errors may
-      # be caught after some time (when the training is continuing). So
-      # check on every step if there were any errors raised by the
-      # manager and raise them in the main thread.
-      self.async_ckpt_manager.check_for_errors()
-
-  def save_final(self, step_i, partitioned_train_state, train_state_pspecs):
-    if (self.checkpoint_manager.last_checkpoint_step is None or
-        self.checkpoint_manager.last_checkpoint_step < step_i):
-      self._save(
-          step_i, partitioned_train_state, train_state_pspecs, is_final=True)
-
-  def maybe_sync_multihostcheckpointing(self):
-    if self.multi_host_checkpointing:
-      py_utils.sync_global_devices(
-          f'checkpointer:restored:{self.checkpoint_dir}')
-
-  def restore(self, train_state_global_shapes, global_mesh, train_state_pspecs):
-    return checkpoints.restore_checkpoint(
-        train_state_global_shapes,
-        self.checkpoint_dir,
-        global_mesh=global_mesh,
-        checkpoint_type=self._checkpoint_type,
-        state_specs=train_state_pspecs,
-        use_orbax=False)
-
-  @property
-  def checkpoint_type(self) -> CheckpointType:
-    return self._checkpoint_type
-
-
 class _OrbaxPjitTrainingCheckpointer(_TrainingCheckpointer):
 
   def __init__(self,
@@ -238,7 +162,10 @@ class _OrbaxPjitTrainingCheckpointer(_TrainingCheckpointer):
   def _save_with_args(self, step_i, partitioned_train_state):
     if not self._enable_checkpoint_saving:
       return
-    self.checkpoint_manager.save(step_i, partitioned_train_state)
+    with py_utils.timeit() as save_period:
+      self.checkpoint_manager.save(step_i, partitioned_train_state)
+    monitoring.record_event_duration_secs(_WRITE_CHECKPOINT_EVENT,
+                                          save_period.elapsed)
 
   def _restore_with_args(self, step_i, train_state_global_shapes, global_mesh,
                          train_state_pspecs):
@@ -268,109 +195,12 @@ class _OrbaxPjitTrainingCheckpointer(_TrainingCheckpointer):
     if step is None:
       partitioned_train_state = None
     else:
-      partitioned_train_state = self._restore_with_args(
-          step, train_state_global_shapes, global_mesh, train_state_pspecs)
+      with py_utils.timeit() as restore_period:
+        partitioned_train_state = self._restore_with_args(
+            step, train_state_global_shapes, global_mesh, train_state_pspecs)
+      monitoring.record_event_duration_secs(_READ_CHECKPOINT_EVENT,
+                                            restore_period.elapsed)
     return partitioned_train_state
-
-  @property
-  def checkpoint_type(self) -> CheckpointType:
-    return self._checkpoint_type
-
-
-class _PmapTrainingCheckpointer(_TrainingCheckpointer):
-
-  def __init__(self,
-               job_log_dir: epath.Path,
-               checkpoint_manager: checkpoint_managers.CheckpointManager,
-               checkpoint_type: CheckpointType,
-               async_ckpt_manager,
-               async_checkpointer,
-               enable_checkpoint_saving: bool = True):
-    self.job_log_dir = job_log_dir
-    self.checkpoint_dir = _checkpoint_dir(job_log_dir)
-    self._checkpoint_type = checkpoint_type
-    self.checkpoint_manager = checkpoint_manager
-    self.async_ckpt_manager = async_ckpt_manager
-    self.async_checkpointer = async_checkpointer
-    self._enable_checkpoint_saving = enable_checkpoint_saving
-
-  def _restore_from_tensorstore(self, train_state_global_shapes):
-    _make_checkpoint_dir(self.job_log_dir)
-    checkpoints.delete_temp_directories(self.checkpoint_dir)
-    logging.info('Pmap restore from TensorStore checkpoint...')
-    # Restored from GDA checkpoint dir.
-    return tasks_lib.restore_pmap_from_tensorstore(
-        train_state_global_shapes,
-        self.checkpoint_dir,
-        checkpoint_type=self._checkpoint_type)
-
-  def restore(self, train_state_global_shapes, global_mesh, train_state_pspecs):
-    if py_utils.pmap_use_tensorstore():
-      return self._restore_from_tensorstore(train_state_global_shapes)
-    else:
-      return checkpoints.restore_checkpoint(
-          train_state_global_shapes,
-          self.checkpoint_dir,
-          checkpoint_type=self._checkpoint_type)
-
-  def _save(self, step_i, partitioned_train_state, is_final=False):
-    if not self._enable_checkpoint_saving:
-      return
-    logging.info('Saving a ckpt at %sstep: %d', 'final ' if is_final else '',
-                 step_i)
-    if py_utils.pmap_use_tensorstore():
-      logging.info('Pmap saving a TensorStore ckpt at step: %d', step_i)
-      py_utils.sync_global_devices(
-          f'checkpointer:saving:{self.checkpoint_dir}:step-{step_i}')
-      if jax.config.jax_array:
-        fully_replicated_gda_model_states = jax.tree_map(
-            py_utils.convert_host_local_array_to_global_array,
-            partitioned_train_state)
-      else:
-        fully_replicated_gda_model_states = jax.tree_map(
-            py_utils.convert_fully_replicated_sda_to_gda,
-            partitioned_train_state)
-
-      fully_replicated_state_specs = jax.tree_map(
-          lambda x: pjit.PartitionSpec(None), fully_replicated_gda_model_states)
-      checkpoints.save_checkpoint(
-          fully_replicated_gda_model_states,
-          self.checkpoint_dir,
-          checkpoint_type=self._checkpoint_type,
-          state_specs=fully_replicated_state_specs,
-          async_ckpt_manager=self.async_ckpt_manager,
-          use_orbax=False,
-          async_checkpointer=self.async_checkpointer)
-      py_utils.sync_global_devices(
-          f'checkpointer:saved:{self.checkpoint_dir}:step-{step_i}')
-    else:
-      if jax.process_index() == 0:
-        # We just need to save the first model replica.
-        unreplicated_model_states = jax.tree_map(lambda x: x[0],
-                                                 partitioned_train_state)
-        checkpoints.save_checkpoint(
-            unreplicated_model_states,
-            self.checkpoint_dir,
-            checkpoint_type=self._checkpoint_type,
-            use_orbax=False,
-            async_checkpointer=self.async_checkpointer)
-    self.checkpoint_manager.save_metadata(global_step_id=step_i, force=is_final)
-
-  def save_if_needed(self, step_i, partitioned_train_state, train_state_pspecs):
-    if self.checkpoint_manager.should_save(step_i):
-      self._save(step_i, partitioned_train_state, is_final=False)
-
-    if self.async_ckpt_manager is not None:
-      # Since the checkpoint is happening asynchronously, the errors may
-      # be caught after some time (when the training is continuing). So
-      # check on every step if there were any errors raised by the
-      # manager and raise them in the main thread.
-      self.async_ckpt_manager.check_for_errors()
-
-  def save_final(self, step_i, partitioned_train_state, train_state_pspecs):
-    if (self.checkpoint_manager.last_checkpoint_step is None or
-        self.checkpoint_manager.last_checkpoint_step < step_i):
-      self._save(step_i, partitioned_train_state, is_final=True)
 
   @property
   def checkpoint_type(self) -> CheckpointType:
@@ -398,19 +228,21 @@ class _OrbaxPmapTrainingCheckpointer(_TrainingCheckpointer):
     return tasks_lib.restore_pmap_from_tensorstore(
         train_state_global_shapes,
         self.checkpoint_dir,
-        checkpoint_type=self._checkpoint_type,
-        use_orbax=True)
+        checkpoint_type=self._checkpoint_type)
 
   def restore(self, train_state_global_shapes, global_mesh, train_state_pspecs):
-    if py_utils.pmap_use_tensorstore():
-      return self._restore_from_tensorstore(train_state_global_shapes)
-    else:
-      step = self.checkpoint_manager.latest_step()
-      if step is None:
-        train_state = None
+    with py_utils.timeit() as restore_period:
+      if py_utils.pmap_use_tensorstore():
+        train_state = self._restore_from_tensorstore(train_state_global_shapes)
       else:
-        train_state = self.checkpoint_manager.restore(
-            step, items=train_state_global_shapes)
+        step = self.checkpoint_manager.latest_step()
+        if step is None:
+          train_state = None
+        else:
+          train_state = self.checkpoint_manager.restore(
+              step, items=train_state_global_shapes)
+    monitoring.record_event_duration_secs(_READ_CHECKPOINT_EVENT,
+                                          restore_period.elapsed)
     return train_state
 
   def _save_with_args(self, step_i, train_state):
@@ -423,22 +255,25 @@ class _OrbaxPmapTrainingCheckpointer(_TrainingCheckpointer):
     if not self._enable_checkpoint_saving:
       return
 
-    if py_utils.pmap_use_tensorstore():
-      logging.info('Saving a ckpt at %sstep: %d', 'final ' if is_final else '',
-                   step_i)
-      if jax.config.jax_array:
-        fully_replicated_gda_train_state = jax.tree_map(
-            py_utils.convert_host_local_array_to_global_array,
-            partitioned_train_state)
+    with py_utils.timeit() as save_period:
+      if py_utils.pmap_use_tensorstore():
+        logging.info('Saving a ckpt at %sstep: %d',
+                     'final ' if is_final else '', step_i)
+        if jax.config.jax_array:
+          fully_replicated_gda_train_state = jax.tree_map(
+              py_utils.convert_host_local_array_to_global_array,
+              partitioned_train_state)
+        else:
+          fully_replicated_gda_train_state = jax.tree_map(
+              py_utils.convert_fully_replicated_sda_to_gda,
+              partitioned_train_state)
+        self._save_with_args(step_i, fully_replicated_gda_train_state)
       else:
-        fully_replicated_gda_train_state = jax.tree_map(
-            py_utils.convert_fully_replicated_sda_to_gda,
-            partitioned_train_state)
-      self._save_with_args(step_i, fully_replicated_gda_train_state)
-    else:
-      unreplicated_train_state = jax.tree_map(lambda x: x[0],
-                                              partitioned_train_state)
-      self._save_with_args(step_i, unreplicated_train_state)
+        unreplicated_train_state = jax.tree_map(lambda x: x[0],
+                                                partitioned_train_state)
+        self._save_with_args(step_i, unreplicated_train_state)
+    monitoring.record_event_duration_secs(_WRITE_CHECKPOINT_EVENT,
+                                          save_period.elapsed)
 
   def save_if_needed(self, step_i, partitioned_train_state, train_state_pspecs):
     if not self.checkpoint_manager.should_save(step_i):
@@ -461,9 +296,6 @@ def _create_checkpointer(
     job_log_dir: epath.Path,
     checkpoint_type: CheckpointType,
     todelete_subdir: Optional[str],
-    use_orbax: bool = False,
-    async_ckpt_manager: Optional[
-        gda_serialization.GlobalAsyncCheckpointManagerBase] = None,
     async_checkpointer: Optional[checkpoints.AsyncCheckpointer] = None,
     enable_checkpoint_saving: bool = True,
 ) -> _TrainingCheckpointer:
@@ -473,68 +305,41 @@ def _create_checkpointer(
   max_to_keep = train_p.save_max_to_keep
   save_interval_steps = train_p.save_interval_steps
   keep_interval_timedelta = _parse_duration(train_p.save_keep_interval_duration)
-  if use_orbax:
-    options = checkpoint_managers.CheckpointManagerOptions(
-        max_to_keep=max_to_keep,
-        save_interval_steps=save_interval_steps,
-        keep_time_interval=keep_interval_timedelta,
-        todelete_subdir=todelete_subdir)
-    checkpointer = async_checkpointer
-    if checkpoint_type == CheckpointType.CHECKPOINT_FLAX:
-      checkpointer = checkpoints.FlaxCheckpointer()
-    if checkpointer is None:
-      if checkpoint_type == CheckpointType.CHECKPOINT_GDA:
-        checkpointer = Checkpointer(
-            PaxCheckpointHandler(enable_aggregation=False))
-      elif checkpoint_type == CheckpointType.CHECKPOINT_PERSISTENCE:
-        raise ValueError('Checkpointer must already be initialized.')
-      else:
-        raise ValueError(
-            f'Unsupported Orbax checkpoint type: {checkpoint_type}')
-    checkpoint_manager = checkpoint_managers.OrbaxCheckpointManager(
-        checkpoint_dir,
-        checkpointer,
-        options=options,
-        checkpoint_type=checkpoint_type)
-  else:
-    checkpoint_manager = checkpoint_managers.CheckpointManager(
-        config_name='',
-        root_dir=checkpoint_dir,
-        checkpoint_type=checkpoint_type,
-        max_to_keep=max_to_keep,
-        save_interval_steps=save_interval_steps,
-        keep_interval_timedelta=keep_interval_timedelta,
-        todelete_subdir=todelete_subdir)
+
+  options = checkpoint_managers.CheckpointManagerOptions(
+      max_to_keep=max_to_keep,
+      save_interval_steps=save_interval_steps,
+      keep_time_interval=keep_interval_timedelta,
+      todelete_subdir=todelete_subdir)
+  checkpointer = async_checkpointer
+  if checkpoint_type == CheckpointType.CHECKPOINT_FLAX:
+    checkpointer = checkpoints.FlaxCheckpointer()
+  if checkpointer is None:
+    if checkpoint_type == CheckpointType.CHECKPOINT_GDA:
+      checkpointer = Checkpointer(
+          PaxCheckpointHandler(enable_aggregation=False))
+    elif checkpoint_type == CheckpointType.CHECKPOINT_PERSISTENCE:
+      raise ValueError('Checkpointer must already be initialized.')
+    else:
+      raise ValueError(f'Unsupported Orbax checkpoint type: {checkpoint_type}')
+  checkpoint_manager = checkpoint_managers.OrbaxCheckpointManager(
+      checkpoint_dir,
+      checkpointer,
+      options=options,
+      checkpoint_type=checkpoint_type)
 
   if task_p.model.ici_mesh_shape is not None:
-    if use_orbax:
-      checkpointer = _OrbaxPjitTrainingCheckpointer(
-          checkpoint_manager,
-          checkpoint_type,
-          enable_checkpoint_saving=enable_checkpoint_saving)
-    else:
-      checkpointer = _PjitTrainingCheckpointer(
-          checkpoint_manager,
-          checkpoint_type,
-          async_ckpt_manager,
-          async_checkpointer,
-          job_log_dir,
-          enable_checkpoint_saving=enable_checkpoint_saving)
+    checkpointer = _OrbaxPjitTrainingCheckpointer(
+        checkpoint_manager,
+        checkpoint_type,
+        enable_checkpoint_saving=enable_checkpoint_saving)
   else:
-    if use_orbax:
-      checkpointer = _OrbaxPmapTrainingCheckpointer(
-          job_log_dir,
-          checkpoint_manager,
-          checkpoint_type,
-          enable_checkpoint_saving=enable_checkpoint_saving)
-    else:
-      checkpointer = _PmapTrainingCheckpointer(
-          job_log_dir,
-          checkpoint_manager,
-          checkpoint_type,
-          async_ckpt_manager,
-          async_checkpointer,
-          enable_checkpoint_saving=enable_checkpoint_saving)
+    checkpointer = _OrbaxPmapTrainingCheckpointer(
+        job_log_dir,
+        checkpoint_manager,
+        checkpoint_type,
+        enable_checkpoint_saving=enable_checkpoint_saving)
+
   return checkpointer
 
 
@@ -605,11 +410,8 @@ def train_and_evaluate(
     eval_on_test: Optional[bool],
     checkpoint_todelete_subdir: Optional[str] = None,
     early_stopping_fn: Optional[trainer_lib.EarlyStoppingFn] = None,
-    async_ckpt_manager: Optional[
-        gda_serialization.GlobalAsyncCheckpointManagerBase] = None,
     run_decode: bool = False,
     enable_auto_sharding: bool = False,
-    use_orbax: bool = False,
     async_checkpointer: Optional[checkpoints.AsyncCheckpointer] = None,
     enable_checkpoint_saving: bool = True) -> None:
   """The shared path to run the training and evaluation loop.
@@ -629,15 +431,10 @@ def train_and_evaluate(
       and determining whether to early stop current training. The callable
       object has signature: (metrics_by_dataset, ckpt_step, is_final_ckpt) ->
       should_stop_early.
-    async_ckpt_manager: Asynchronous checkpoint manager which manages
-      serialization and deserialization of GDA arrays. This manager allows
-      training to continue when checkpointing is going on as checkpointing
-      happens in a different thread.
     run_decode: whether to periodically run decode as part of the training loop.
       If and only if this is True, every `task_p.train.decode_interval_steps` of
       training, model runs decode.
     enable_auto_sharding: Enables the XLA Auto SPMD partitioner.
-    use_orbax: Enables checkpointing backed by Orbax.
     async_checkpointer: When async checkpointing and Orbax are enabled, allows
       training to continue when checkpointing is going on as checkpointing
       happens in a different thread.
@@ -664,8 +461,9 @@ def train_and_evaluate(
   train_input_p = train_input_p[0]
   logging.info('train_input_p=%s', train_input_p.to_text())
   logging.info('task_p=%s', task_p.to_text())
-  eval_input_p = None
-  if eval_on_test:
+  eval_input_p = []
+  if (eval_on_test and task_p.train.eval_interval_steps is not None and
+      task_p.train.eval_interval_steps > 0):
     eval_input_p = [v for v in input_p if not v.is_training]
 
   if (run_decode and task_p.train.decode_interval_steps is not None and
@@ -687,8 +485,6 @@ def train_and_evaluate(
       job_log_dir,
       checkpoint_type,
       checkpoint_todelete_subdir,
-      use_orbax=use_orbax,
-      async_ckpt_manager=async_ckpt_manager,
       async_checkpointer=async_checkpointer,
       enable_checkpoint_saving=enable_checkpoint_saving)
   if not enable_checkpoint_saving:
@@ -830,7 +626,7 @@ def train_and_evaluate_pmap(
     train_input_p: base_input.BaseInput.HParams,
     job_log_dir: epath.Path,
     checkpointer: _TrainingCheckpointer,
-    eval_input_p: Optional[Sequence[base_input.BaseInput.HParams]],
+    eval_input_p: Sequence[base_input.BaseInput.HParams],
     decode_input_p: Sequence[base_input.BaseInput.HParams],
     early_stopping_fn: Optional[trainer_lib.EarlyStoppingFn] = None) -> None:
   """Runs the training and evaluation loop with PMAP.
@@ -840,8 +636,8 @@ def train_and_evaluate_pmap(
     train_input_p: HParams for the train data input pipeline.
     job_log_dir: Directory for the job logs.
     checkpointer: Callbacks for checkpointing.
-    eval_input_p: Optional list of hparams for the eval input pipelines.
-    decode_input_p: Optional list of hparams for the decode input pipelines.
+    eval_input_p: list of hparams for the eval input pipelines.
+    decode_input_p: list of hparams for the decode input pipelines.
     early_stopping_fn: An optional callable object for reporting eval metrics
       and determining whether to early stop current training. The callable
       object has signature: (metrics_by_dataset, ckpt_step, is_final_ckpt) ->
@@ -881,8 +677,11 @@ def train_and_evaluate_pmap(
       train_state_metadata.partitioned_specs)
   # Randomly initialized variables if no files in checkpoint dir.
   if model_states is None:
-    model_states = trainer_lib.initialize_model_state(jax_task, init_key,
-                                                      inputs_shape_dtype)
+    model_states = trainer_lib.initialize_model_state(
+        jax_task,
+        init_key,
+        inputs_shape_dtype,
+        checkpoint_type=checkpointer.checkpoint_type)
 
   logging.info('model_states=%s', jax.tree_map(lambda x: x.shape, model_states))
 
@@ -915,19 +714,11 @@ def train_and_evaluate_pmap(
   def train_step(states, prng_key, inputs):
     """Train model for a single step."""
     return trainer_lib.train_step_single_learner(
-        jax_task,
-        states,
-        prng_key,
-        inputs,
-        fprop_dtype=fprop_dtype)
+        jax_task, states, prng_key, inputs, fprop_dtype=fprop_dtype)
 
   def eval_step(eval_states, prng_key, inputs):
     return trainer_lib.eval_step_single_learner(
-        jax_task,
-        eval_states,
-        prng_key,
-        inputs,
-        fprop_dtype=fprop_dtype)
+        jax_task, eval_states, prng_key, inputs, fprop_dtype=fprop_dtype)
 
   def prepare_model_inputs(train_input_pipeline, model_inputs, step_counter):
     del step_counter  # Unused in pmap flow
@@ -948,18 +739,15 @@ def train_and_evaluate_pmap(
       train_input_p.num_infeed_hosts)
 
   p_train_step = jax.pmap(
-      train_step,
-      donate_argnums=(0,),
-      axis_name=PMAP_PARALLEL_AXIS_NAME)
-  p_eval_step = jax.pmap(
-      eval_step,
-      axis_name=PMAP_PARALLEL_AXIS_NAME)
+      train_step, donate_argnums=(0,), axis_name=PMAP_PARALLEL_AXIS_NAME)
+  p_eval_step = jax.pmap(eval_step, axis_name=PMAP_PARALLEL_AXIS_NAME)
+  p_eval_steps = [p_eval_step] * len(eval_input_p)
   global_mesh = None
   reshard_inputs = True
   create_gda_for_inputs = False
   is_vars_replicated = True
 
-  def partition_eval_input(eval_input_p):
+  def partition_eval_input_fns(eval_input_p):
     eval_input_pipelines = [instantiate(input_p) for input_p in eval_input_p]
     trainer_lib.check_unique_names(eval_input_pipelines)
     # We either run p.eval_loop_num_batches steps or one epoch (when supported
@@ -977,7 +765,7 @@ def train_and_evaluate_pmap(
     return (eval_input_pipelines, eval_num_steps, eval_test_inputs_shape_dtype,
             eval_test_inputs_pspecs, eval_input_p)
 
-  def partition_decode_once_fn(prng_key, decode_input_p):
+  def partition_decode_once_fns(prng_key, decode_input_p):
     decode_input_pipelines = [
         instantiate(input_p) for input_p in decode_input_p
     ]
@@ -992,12 +780,13 @@ def train_and_evaluate_pmap(
 
   _train_and_evaluate_common(
       partitioned_train_state, prng_key, eval_input_p, decode_input_p, task_p,
-      total_num_params, early_stopping_fn, checkpointer, partition_eval_input,
-      partition_decode_once_fn, job_log_dir, eval_prng_seed, reshard_inputs,
-      train_p, prepare_eval_inputs, prepare_model_inputs, is_vars_replicated,
+      total_num_params, early_stopping_fn, checkpointer,
+      partition_eval_input_fns, partition_decode_once_fns, job_log_dir,
+      eval_prng_seed, reshard_inputs, train_p, prepare_eval_inputs,
+      prepare_model_inputs, is_vars_replicated,
       train_unpadded_global_batch_size, train_state_metadata,
-      train_input_pipeline, p_train_step, p_eval_step, global_mesh,
-      create_gda_for_inputs, train_prng_seed)
+      train_input_pipeline, p_train_step, p_eval_steps, p_eval_step,
+      global_mesh, create_gda_for_inputs, train_prng_seed)
 
 
 def train_and_evaluate_spmd_model(
@@ -1006,7 +795,7 @@ def train_and_evaluate_spmd_model(
     job_log_dir: epath.Path,
     checkpointer: _TrainingCheckpointer,
     checkpoint_type: CheckpointType,
-    eval_input_p: Optional[Sequence[base_input.BaseInput.HParams]],
+    eval_input_p: Sequence[base_input.BaseInput.HParams],
     decode_input_p: Sequence[base_input.BaseInput.HParams],
     early_stopping_fn: Optional[trainer_lib.EarlyStoppingFn] = None,
     enable_auto_sharding: bool = False) -> None:
@@ -1018,8 +807,8 @@ def train_and_evaluate_spmd_model(
     job_log_dir: Directory for the job logs.
     checkpointer: Callbacks for checkpointing.
     checkpoint_type: The type of checkpoint to use.
-    eval_input_p: Optional list of params for the eval input pipelines.
-    decode_input_p: Optional list of hparams for the decode input pipelines.
+    eval_input_p: list of params for the eval input pipelines.
+    decode_input_p: list of hparams for the decode input pipelines.
     early_stopping_fn: An optional callable object for reporting eval metrics
       and determining whether to early stop current training. The callable
       object has signature: (metrics_by_dataset, ckpt_step, is_final_ckpt) ->
@@ -1027,14 +816,14 @@ def train_and_evaluate_spmd_model(
     enable_auto_sharding: Enables the XLA Auto SPMD partitioner.
   """
   logging.info('Using SPMD sharding for model parallelism.')
+  assert py_utils.gda_or_jax_array(), 'GDA or jax.Array must be enabled'
+
   model_p = task_p.model
   local_device_count = jax.local_device_count()
 
   # TODO(bf-jax): Retrieve the seeds from the model definition instead.
   prng_key = jax.random.PRNGKey(1234)
   prng_key, init_key = jax.random.split(prng_key)
-
-  assert py_utils.gda_or_jax_array(), 'GDA or jax.Array must be enabled'
 
   device_mesh = py_utils.create_device_mesh(model_p.ici_mesh_shape,
                                             model_p.dcn_mesh_shape)
@@ -1046,21 +835,18 @@ def train_and_evaluate_spmd_model(
   create_gda_for_inputs = (
       py_utils.gda_or_jax_array() and
       checkpoint_type != CheckpointType.CHECKPOINT_PERSISTENCE)
-  train_unpadded_global_batch_size = (
-      train_input_p.cls.get_batch_size(train_input_p) *
-      train_input_p.num_infeed_hosts)
+
   train_input_p = trainer_lib.adjust_input_params_for_small_batch(
       train_input_p, global_mesh)
-  train_input_for_shape = instantiate(train_input_p)
-  train_sample_inputs = train_input_for_shape.get_next_padded()
-  # TODO(pax-dev): Retrieve shapes from input specs and compare against real
-  # input shapes from training input pipeline.
-  perhost_inputs_shape_dtype = jax.tree_map(
-      lambda x: jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype),
-      train_sample_inputs)
+  train_input = instantiate(train_input_p)
+  jax_task = instantiate(task_p)
+
+  trainer = trainer_lib.SingleTaskPjitTrainer(jax_task, train_input,
+                                              global_mesh, enable_auto_sharding)
+
+  perhost_inputs_shape_dtype = trainer.perhost_inputs_shape_dtype
   _write_input_specs(perhost_inputs_shape_dtype, job_log_dir)
-  inputs_shape_dtype = jax.tree_map(py_utils.get_global_input_shape_dtype,
-                                    train_sample_inputs)
+  inputs_shape_dtype = trainer.inputs_shape_dtype
 
   def prepare_model_inputs(input_pipeline, model_inputs, step_counter):
     if (create_gda_for_inputs or
@@ -1082,9 +868,7 @@ def train_and_evaluate_spmd_model(
           eval_inputs, inputs_shape_dtype, global_mesh, inputs_pspecs)
     return eval_inputs
 
-  jax_task = instantiate(task_p)
-  train_state_metadata = trainer_lib.create_train_state_metadata(
-      jax_task, inputs_shape_dtype)
+  train_state_metadata = trainer.train_state_metadata
 
   # Dump out model meta info for debugging.
   trainer_lib.write_post_init_model_hparams_file(
@@ -1119,16 +903,20 @@ def train_and_evaluate_spmd_model(
       raise NotImplementedError(
           'Per-device batch size < 1 not supported for auto sharding.')
     logging.info('Auto sharding is enabled in PAX.')
-  (p_train_step, inputs_pspecs, train_state_metadata.partitioned_specs
-  ) = trainer_lib.get_partitioned_spmd_model_step_fn(
-      jax_task,
-      trainer_lib.RunningMode.TRAIN,
-      global_mesh,
-      train_prng_seed,
-      inputs_shape_dtype,
-      train_state_partition_spec=train_state_metadata.partitioned_specs,
-      unpadded_global_batch_size=train_unpadded_global_batch_size,
-      enable_auto_sharding=enable_auto_sharding)
+  (p_train_step, inputs_pspecs,
+   partitioned_specs) = trainer.compile_step(train_prng_seed)
+  if (not enable_auto_sharding and
+      train_state_metadata.partitioned_specs != partitioned_specs):
+    raise ValueError(
+        'Manually partitioned spec in train_state diverges with partitioner.\n'
+        f'Manual partition_spec: {train_state_metadata.partitioned_specs}\n'
+        f'Partitioned spec from partitioner: {partitioned_specs}')
+
+  # Replace the partition spec. This only has effect when enable_auto_sharding
+  # is turned on since the original train_state_metadata would have `None` as
+  # original sharding.
+  train_state_metadata = dataclasses.replace(
+      train_state_metadata, partitioned_specs=partitioned_specs)
 
   # Try to restore from checkpoint.
   partitioned_train_state = checkpointer.restore(
@@ -1153,15 +941,35 @@ def train_and_evaluate_spmd_model(
   # TODO(pax): Support auto-sharding for eval step. In this case, we would
   # have to fix the sharding of the input to be the same as what's derived
   # from the train_step.
-  p_eval_step, _, _ = trainer_lib.get_partitioned_spmd_model_step_fn(
+
+  p_eval_on_train_step, _, _ = trainer_lib.get_partitioned_spmd_model_step_fn(
       jax_task,
-      trainer_lib.RunningMode.EVAL,
+      RunningMode.EVAL,
       global_mesh,
       init_key,
       inputs_shape_dtype,
-      train_state_partition_spec=train_state_metadata.partitioned_specs
-      .to_eval_state(),
-      unpadded_global_batch_size=train_unpadded_global_batch_size)
+      train_state_partition_spec=(
+          train_state_metadata.partitioned_specs.to_eval_state()),
+      # TODO(hthu): This should be from a evaluator?
+      unpadded_global_batch_size=trainer.train_unpadded_global_batch_size)
+
+  p_eval_steps = []
+  padded_eval_input_p = eval_input_p
+  if eval_input_p:
+    padded_eval_input_p = [
+        trainer_lib.adjust_input_params_for_small_batch(input_p, global_mesh)
+        for input_p in eval_input_p
+    ]
+    p_eval_steps, _, _, _ = trainer_lib.get_spmd_model_step_fns_from_inputs(
+        padded_eval_input_p,
+        eval_input_p,
+        jax_task,
+        RunningMode.EVAL,
+        global_mesh,
+        init_key,
+        inputs_shape_dtype,
+        train_state_partition_spec=(
+            train_state_metadata.partitioned_specs.to_eval_state()))
 
   logging.info(
       'partitioned_train_state shapes '
@@ -1179,98 +987,106 @@ def train_and_evaluate_spmd_model(
   reshard_inputs = False
   is_vars_replicated = False
 
-  def partition_eval_input(eval_input_p):
-    eval_input_p = [
-        trainer_lib.adjust_input_params_for_small_batch(input_p, global_mesh)
-        for input_p in eval_input_p
-    ]
-    eval_input_pipelines = [instantiate(input_p) for input_p in eval_input_p]
+  def partition_eval_input_fns(padded_eval_input_ps):
+    assert padded_eval_input_ps, 'padded_eval_input_ps must not be empty'
+    eval_input_pipelines = [
+        instantiate(input_p) for input_p in padded_eval_input_ps]
     trainer_lib.check_unique_names(eval_input_pipelines)
-    # Do not mutate eval_input_pipelines itself. Instantiate a new one
-    # to get sample input.
-    sample_eval_model_inputs = instantiate(eval_input_p[0]).get_next_padded()
-    eval_test_inputs_shape_dtype = jax.tree_util.tree_map(
-        py_utils.get_global_input_shape_dtype, sample_eval_model_inputs)
-    eval_test_inputs_pspecs = trainer_lib.get_input_partition_specs(
-        model_p.mesh_axis_names, eval_test_inputs_shape_dtype)
 
-    # We either run p.eval_loop_num_batches steps or one epoch (when supported
-    # by a resettable input) per eval loop during training. When
-    # p.reset_for_eval is set to True, we run the eval loop until
-    # tf.errors.OutOfRangeError (or StopIteration) is raised, which can be
-    # triggered either because input pipeline has reached the end of the input
-    # sequence, or a pre-determined num_batches has reached.
-    eval_num_steps = [
-        -1 if p.reset_for_eval else p.eval_loop_num_batches
-        for p in eval_input_p
-    ]
-    return (eval_input_pipelines, eval_num_steps,
-            eval_test_inputs_shape_dtype, eval_test_inputs_pspecs,
-            eval_input_p)
+    eval_num_steps = []
+    eval_test_inputs_pspecs = []
+    eval_test_inputs_shape_dtypes = []
+    for p in padded_eval_input_ps:
+      # Do not mutate eval_input_pipelines itself. Instantiate a new one
+      # to get sample input.
+      sample_eval_model_inputs = instantiate(p).get_next_padded()
+      inputs_shape_dtype = jax.tree_util.tree_map(
+          py_utils.get_global_input_shape_dtype, sample_eval_model_inputs)
+      eval_test_inputs_shape_dtypes.append(inputs_shape_dtype)
+      eval_test_inputs_pspecs.append(trainer_lib.get_input_partition_specs(
+          model_p.mesh_axis_names, inputs_shape_dtype))
 
-  def partition_decode_once_fn(prng_key, decode_input_p):
-    decode_input_p_0 = decode_input_p[0]
-    decode_unpadded_global_batch_size = (
-        decode_input_p_0.cls.get_batch_size(decode_input_p_0) *
-        decode_input_p_0.num_infeed_hosts)
-    decode_input_p = [
-        trainer_lib.adjust_input_params_for_small_batch(input_p, global_mesh)
-        for input_p in decode_input_p
-    ]
-    decode_input_pipelines = [
-        instantiate(input_p) for input_p in decode_input_p
-    ]
-    trainer_lib.check_unique_names(decode_input_pipelines)
-    decode_sample_inputs = instantiate(decode_input_p[0]).get_next_padded()
-    decode_inputs_shape_dtype = jax.tree_util.tree_map(
-        py_utils.get_global_input_shape_dtype, decode_sample_inputs)
+      # We either run p.eval_loop_num_batches steps or one epoch (when supported
+      # by a resettable input) per eval loop during training. When
+      # p.reset_for_eval is set to True, we run the eval loop until
+      # tf.errors.OutOfRangeError (or StopIteration) is raised, which can be
+      # triggered either because input pipeline has reached the end of the input
+      # sequence, or a pre-determined num_batches has reached.
+      eval_num_steps.append(-1 if p.reset_for_eval else p.eval_loop_num_batches)
+
+    return (eval_input_pipelines, eval_num_steps, eval_test_inputs_shape_dtypes,
+            eval_test_inputs_pspecs, padded_eval_input_ps)
+
+  def partition_decode_once_fns(
+      prng_key: jax.random.KeyArray,
+      decode_input_ps: Sequence[base_input.BaseInput.HParams]) -> Tuple[
+          Callable[..., tuning_lib.DecodeMetrics],
+          jax.random.KeyArray, Sequence[base_input.BaseInput.HParams],
+      ]:
+    assert decode_input_ps, 'decode_input_p must not be empty'
     prng_key, decode_key = jax.random.split(prng_key, 2)
     logging.info('decode prng_key: %s', decode_key)
     decode_key = _broadcast_key(decode_key)
+
+    padded_decode_input_ps = [
+        trainer_lib.adjust_input_params_for_small_batch(input_p, global_mesh)
+        for input_p in decode_input_ps
+    ]
+    padded_decode_input_pipelines = [
+        instantiate(input_p) for input_p in decode_input_ps
+    ]
+    trainer_lib.check_unique_names(padded_decode_input_pipelines)
+
     # TODO(pax-dev): Support auto-sharding for decoder step.
-    decode_step_fn, decode_inputs_partition_spec, _ = (
-        trainer_lib.get_partitioned_spmd_model_step_fn(
-            jax_task,
-            trainer_lib.RunningMode.DECODE,
-            global_mesh,
-            init_key,
-            decode_inputs_shape_dtype,
-            train_sample_inputs,
-            train_state_partition_spec=train_state_metadata.partitioned_specs
-            .to_eval_state(),
-            unpadded_global_batch_size=decode_unpadded_global_batch_size))
+    (decode_step_fns, decode_input_partition_specs,
+     decode_inputs_shape_dtypes, _) = (
+         trainer_lib.get_spmd_model_step_fns_from_inputs(
+             padded_decode_input_ps,
+             decode_input_ps,
+             jax_task,
+             RunningMode.DECODE,
+             global_mesh,
+             init_key,
+             inputs_shape_dtype,
+             train_state_partition_spec=(
+                 train_state_metadata.partitioned_specs.to_eval_state())))
+
     decode_once_fn = eval_lib.partition_decode_once_spmd_model(
-        jax_task, task_p, decode_input_pipelines, decode_input_p, job_log_dir,
-        decode_key, global_mesh, decode_step_fn, create_gda_for_inputs,
-        decode_inputs_shape_dtype, decode_inputs_partition_spec)
-    return decode_once_fn, prng_key, decode_input_p
+        jax_task, task_p, padded_decode_input_pipelines, padded_decode_input_ps,
+        job_log_dir, decode_key, global_mesh, decode_step_fns,
+        create_gda_for_inputs, decode_inputs_shape_dtypes,
+        decode_input_partition_specs)
+
+    return decode_once_fn, prng_key, decode_input_ps
 
   _train_and_evaluate_common(
-      partitioned_train_state, prng_key, eval_input_p, decode_input_p, task_p,
-      total_num_params, early_stopping_fn, checkpointer, partition_eval_input,
-      partition_decode_once_fn, job_log_dir, eval_prng_seed, reshard_inputs,
-      train_p, prepare_eval_inputs, prepare_model_inputs, is_vars_replicated,
-      train_unpadded_global_batch_size, train_state_metadata,
-      train_input_pipeline, p_train_step, p_eval_step, global_mesh,
-      create_gda_for_inputs, train_prng_seed)
+      partitioned_train_state, prng_key, padded_eval_input_p, decode_input_p,
+      task_p, total_num_params, early_stopping_fn, checkpointer,
+      partition_eval_input_fns, partition_decode_once_fns, job_log_dir,
+      eval_prng_seed, reshard_inputs, train_p, prepare_eval_inputs,
+      prepare_model_inputs, is_vars_replicated,
+      trainer.train_unpadded_global_batch_size, trainer.train_state_metadata,
+      train_input_pipeline, p_train_step, p_eval_steps, p_eval_on_train_step,
+      global_mesh, create_gda_for_inputs, train_prng_seed)
 
 
 def _train_and_evaluate_common(
     partitioned_train_state, prng_key, eval_input_p, decode_input_p, task_p,
-    total_num_params, early_stopping_fn, checkpointer, partition_eval_input,
-    partition_decode_once_fn, job_log_dir, eval_prng_seed, reshard_inputs,
+    total_num_params, early_stopping_fn, checkpointer, partition_eval_input_fns,
+    partition_decode_once_fns, job_log_dir, eval_prng_seed, reshard_inputs,
     train_p, prepare_eval_inputs, prepare_model_inputs, is_vars_replicated,
     train_unpadded_global_batch_size, train_state_metadata,
-    train_input_pipeline, p_train_step, p_eval_step, global_mesh,
-    create_gda_for_inputs, train_prng_seed):
+    train_input_pipeline, p_train_step, p_eval_steps, p_eval_on_train_step,
+    global_mesh, create_gda_for_inputs, train_prng_seed):
   """Training loop code common to both pmap and spmd."""
 
   if eval_input_p:
-    (eval_input_pipelines, eval_num_steps, eval_test_inputs_shape_dtype,
-     eval_test_inputs_pspecs, eval_input_p) = partition_eval_input(eval_input_p)
+    (eval_input_pipelines, eval_num_steps, eval_test_inputs_shape_dtypes,
+     eval_test_inputs_pspecs, eval_input_p) = partition_eval_input_fns(
+         eval_input_p)
 
   if decode_input_p:
-    decode_once_fn, prng_key, decode_input_p = partition_decode_once_fn(
+    decode_once_fn, prng_key, decode_input_p = partition_decode_once_fns(
         prng_key, decode_input_p)
 
   logging.info('Training loop starting...')
@@ -1307,7 +1123,8 @@ def _train_and_evaluate_common(
 
     profiler = profiling.Profiler(
         num_steps=train_p.profiler_num_steps,
-        min_duration_sec=train_p.profiler_min_duration_sec)
+        min_duration_sec=train_p.profiler_min_duration_sec,
+        max_num_hosts=train_p.profiler_max_num_hosts)
 
     step_i = int(
         py_utils.maybe_unreplicate_for_fully_replicated(
@@ -1394,25 +1211,25 @@ def _train_and_evaluate_common(
       # Run eval at regular step interval.
       if (train_p.eval_interval_steps and
           step_i % train_p.eval_interval_steps == 0):
-        eval_step_fn = functools.partial(
-            p_eval_step, partitioned_train_state.to_eval_state(),
-            eval_prng_seed)
 
         logging.debug('  Starting eval_step().')
         # If we have eval test then also evaluate on test.
         if eval_input_p:
           logging.debug('  Performing eval_step() runs on test splits.')
+          eval_step_fns = [functools.partial(
+              step_fn, partitioned_train_state.to_eval_state(),
+              eval_prng_seed) for step_fn in p_eval_steps]
           with py_utils.timeit() as eval_period:
             eval_metrics_list, eval_scoring_metrics_list, num_eval_steps = (
                 eval_lib.run_eval_loop_over_test_splits(
                     eval_num_steps,
-                    eval_step_fn,
+                    eval_step_fns,
                     eval_test_summary_writers,
                     step_i,
                     eval_input_pipelines,
                     job_log_dir,
                     eval_test_inputs_pspecs,
-                    eval_test_inputs_shape_dtype,
+                    eval_test_inputs_shape_dtypes,
                     global_mesh,
                     reshard_inputs=reshard_inputs,
                     create_gda_for_inputs=create_gda_for_inputs))
@@ -1437,7 +1254,10 @@ def _train_and_evaluate_common(
             logging.debug('  Retrieved eval model_inputs.')
             logging.debug('  Performing eval_step() runs on training split.')
             eval_inputs = prepare_eval_inputs(train_input_pipeline, eval_inputs)
-            loss, weighted_scalars, _, summary_tensors = eval_step_fn(
+            eval_on_train_step_fn = functools.partial(
+                p_eval_on_train_step, partitioned_train_state.to_eval_state(),
+                eval_prng_seed)
+            loss, weighted_scalars, _, summary_tensors = eval_on_train_step_fn(
                 eval_inputs)
             logging.debug('  Completed eval_step() runs on training split.')
             if eval_summary_handler.process(step_i, loss, weighted_scalars,
@@ -1466,7 +1286,7 @@ def _train_and_evaluate_common(
             early_stopping_fn,
             step_i,
             is_last_ckpt=tuning_lib.is_last_checkpoint(
-                trainer_lib.RunningMode.detect(
+                RunningMode.detect(
                     has_train_metrics=True,
                     has_eval_metrics=bool(eval_metrics),
                     has_decode_metrics=bool(decode_metrics)), step_i,

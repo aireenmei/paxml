@@ -6,12 +6,13 @@ clu
 etils
 flax
 jax
-lingvo~=0.12.4
+lingvo
 numpy
 orbax
 praxis
+protobuf==3.19.5
 pyglove
-seqio-nightly
+seqio @ git+https://github.com/google/seqio
 t5
 tensorflow~=2.9.2
 tensorflow-text~=2.9.0
