@@ -539,7 +539,7 @@ class C4SpmdGpt3L16AdamOrgHP64Replicas(C4SpmdGpt3AdamOrgHP):
   r"""Small GPT-3 config in bf16 for 64 replicas with 256 global batch size."""
   NUM_LAYERS = 16
   FPROP_DTYPE = jnp.bfloat16
-  PERCORE_BATCH_SIZE = 4
+  PERCORE_BATCH_SIZE = 1
   ICI_MESH_SHAPE = [1, 4, 16]
 
 
