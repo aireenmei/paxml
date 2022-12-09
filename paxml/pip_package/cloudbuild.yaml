@@ -26,5 +26,5 @@ options:
 timeout: 5400s
 artifacts:
   objects:
-    location: 'gs://pax-on-cloud-tpu-project/wheels/$(date -u +%Y%m%d)'
+    location: 'gs://pax-on-cloud-tpu-project/aireenmei/wheels/$(date -u +%Y%m%d)'
     paths: ['/**/*.whl', '/**/*.txt']

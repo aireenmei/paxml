@@ -56,7 +56,7 @@ COPY . /paxml
 RUN mkdir -p $WHEEL_FOLDER && cd paxml && \
   git rev-parse HEAD > $WHEEL_FOLDER/paxml_commit.txt
 
-RUN git clone https://github.com/google/praxis.git && \
+RUN git clone -b benchmark-20221130 https://github.com/aireenmei/praxis.git && \
   cd praxis && git rev-parse HEAD > $WHEEL_FOLDER/praxis_commit.txt
 
 RUN cp -r praxis/praxis /paxml/

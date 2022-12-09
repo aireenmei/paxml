@@ -8,7 +8,7 @@ flax
 jax
 lingvo
 numpy
-orbax
+orbax==0.0.19
 praxis
 protobuf==3.19.5
 pyglove
