@@ -350,7 +350,7 @@ def run(experiment_config: base_experiment.BaseExperiment,
 
   # Start jax.profiler for TensorBoard and profiling in open source.
   if FLAGS.jax_profiler_port is not None:
-    server = jax.profiler.start_server(FLAGS.jax_profiler_port)  # pylint:disable=unused-variable
+    jax.profiler.start_server(FLAGS.jax_profiler_port)  # pylint:disable=unused-variable
 
   if ((FLAGS.restore_checkpoint_dir or FLAGS.restore_checkpoint_step) and
       FLAGS.mode not in {'decode_once', 'decode'}):

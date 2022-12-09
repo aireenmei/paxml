@@ -181,6 +181,21 @@ class LmCloudSpmd2BLimitSteps(LmCloudSpmd2B):
     task_p.train.num_train_steps = 300
     return task_p
 
+@experiment_registry.register
+class LmCloudSpmd16B(LmCloudSpmd):
+  """SPMD model with ~16B params
+  Global batch size = 1 * 2 * 16 * 16 = 64
+  """
+  PERCORE_BATCH_SIZE = 16
+
+  NUM_LAYERS = 36
+  MODEL_DIMS = 6144
+  HIDDEN_DIMS = MODEL_DIMS * 4
+  MAX_SEQ_LEN = 1024
+
+  SUMMARY_INTERVAL_STEPS = 10
+  CHECKPOINT_POLICY = layers.AutodiffCheckpointType.SAVE_NOTHING
+  ICI_MESH_SHAPE = [1, 16, 2]
 
 @experiment_registry.register
 class LmCloudSpmd32B(LmCloudSpmd):

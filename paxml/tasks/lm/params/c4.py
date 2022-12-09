@@ -40,14 +40,14 @@ from t5.data import preprocessors as t5_preprocessors
 
 WeightInit = base_layer.WeightInit
 
-GPT_SPM_PATH = 'gs://mlperf-llm-public2/vocab/c4_en_301_5Mexp2_spm.model'
+GPT_SPM_PATH = 'gs://mazumdera-paxml-bucket/mlperf-llm-public2/vocab/c4_en_301_5Mexp2_spm.model'
 GPT_EOS_ID = 1
 GPT_VOCABULARY = t5.data.SentencePieceVocabulary(GPT_SPM_PATH)
 C4_GPT_OUTPUT_FEATURES_LM = {
     'targets': t5.data.Feature(vocabulary=GPT_VOCABULARY, add_eos=True)
 }
-C4_TFDS_DATADIR = 'gs://mlperf-llm-public2'
-C4_EVAL_DATADIR = 'gs://mlperf-llm-public2'
+C4_TFDS_DATADIR = 'gs://mazumdera-paxml-bucket/mlperf-llm-public2'
+C4_EVAL_DATADIR = 'gs://mazumdera-paxml-bucket/mlperf-llm-public2'
 
 
 class TaskRegistry(t5.data.TaskRegistry):
@@ -169,7 +169,7 @@ class C4UnsupervisedDataset(base_experiment.BaseExperiment):
     p = seqio_input.SeqIOInput.HParams(
         name='C4Train' if is_training else 'C4Validation',
         mixture_name='c4_lm_v301_gpt' if is_training else 'c4_lm_v301_gpt_eval',
-        split_name='train' if is_training else 'validation_24567exp',
+        split_name='train' if is_training else 'validation',
         task_feature_lengths={'targets': self.MAX_SEQ_LEN},
         use_cached=True,
         repeat=True if is_training else False,
