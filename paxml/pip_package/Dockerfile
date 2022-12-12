@@ -13,6 +13,9 @@ ENV WHEEL_FOLDER $wheel_folder
 ENV PYTHON_VERSION="3"
 ENV PYTHON_MINOR_VERSION="8"
 
+COPY . /paxml
+RUN ls /paxml/paxml/tasks/lm/params/
+
 # Pick up some TF dependencies
 RUN apt update && DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends software-properties-common
 RUN apt update && DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
@@ -50,8 +53,6 @@ RUN mkdir /bazel && \
     ./bazel-$BAZEL_VERSION-installer-linux-x86_64.sh && \
     cd / && \
     rm -f /bazel/bazel-$BAZEL_VERSION-installer-linux-x86_64.sh
-
-COPY . /paxml
 
 RUN mkdir -p $WHEEL_FOLDER && cd paxml && \
   git rev-parse HEAD > $WHEEL_FOLDER/paxml_commit.txt
