@@ -3,7 +3,7 @@ steps:
   args: [
           'build',
           '--build-arg', 'wheel_folder=${_WHEEL_FOLDER}',
-          '-t', 'gcr.io/${PROJECT_ID}/${_IMAGE_NAME}',
+          '-t', 'gcr.io/${PROJECT_ID}/${_IMAGE_NAME}:benchmark',
           '-f', 'paxml/pip_package/Dockerfile', '.'
         ]
   timeout: 3600s
