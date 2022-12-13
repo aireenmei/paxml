@@ -13,9 +13,6 @@ ENV WHEEL_FOLDER $wheel_folder
 ENV PYTHON_VERSION="3"
 ENV PYTHON_MINOR_VERSION="8"
 
-COPY . /paxml
-RUN ls /paxml/paxml/tasks/lm/params/
-
 # Pick up some TF dependencies
 RUN apt update && DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends software-properties-common
 RUN apt update && DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
@@ -54,11 +51,13 @@ RUN mkdir /bazel && \
     cd / && \
     rm -f /bazel/bazel-$BAZEL_VERSION-installer-linux-x86_64.sh
 
-RUN mkdir -p $WHEEL_FOLDER && cd paxml && \
-  git rev-parse HEAD > $WHEEL_FOLDER/paxml_commit.txt
+RUN mkdir -p $WHEEL_FOLDER
+
+RUN git clone -b benchmark-20221130 https://github.com/aireenmei/paxml.git && \
+  cd paxml && git rev-parse HEAD | tee $WHEEL_FOLDER/paxml_commit.txt
 
 RUN git clone -b benchmark-20221130 https://github.com/aireenmei/praxis.git && \
-  cd praxis && git rev-parse HEAD > $WHEEL_FOLDER/praxis_commit.txt
+  cd praxis && git rev-parse HEAD | tee $WHEEL_FOLDER/praxis_commit.txt
 
 RUN cp -r praxis/praxis /paxml/
 
