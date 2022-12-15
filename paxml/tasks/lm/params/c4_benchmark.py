@@ -104,13 +104,13 @@ class C4Spmd64BAdam128Replicas(c4.C4SpmdAdam):
 @experiment_registry.register
 class C4Spmd128BAdam256Replicas(c4.C4SpmdAdam):
   r"""GPT-3 config with 128B params. Model Parameters: 
-  Global batch size = 1 * 64 * 4 * 8 = 2048"""
+  Global batch size = 1 * 64 * 4 * 8 = 1024"""
   NUM_LAYERS = 71
   MODEL_DIMS = 12288
   HIDDEN_DIMS = MODEL_DIMS * 4
   NUM_HEADS = 96
   DIMS_PER_HEAD = 128
-  PERCORE_BATCH_SIZE = 8
+  PERCORE_BATCH_SIZE = 4
   MAX_SEQ_LEN = 1024
   VOCAB_SIZE = 32000
   FPROP_DTYPE = jnp.bfloat16
@@ -157,3 +157,22 @@ class C4Spmd512BAdam1024Replicas(c4.C4SpmdAdam):
   SUMMARY_INTERVAL_STEPS = 10
   CHECKPOINT_POLICY = layers.AutodiffCheckpointType.SAVE_NOTHING
   ICI_MESH_SHAPE = [1, 64, 16]
+
+@experiment_registry.register
+class C4Spmd1024BAdam2048Replicas(c4.C4SpmdAdam):
+  r"""GPT-3 config with 512B params. Model Parameters: 
+  Global batch size = 1 * 256 * 8 * 1 = 4096"""
+  NUM_LAYERS = 142
+  MODEL_DIMS = 24576
+  HIDDEN_DIMS = MODEL_DIMS * 4
+  NUM_HEADS = 192
+  DIMS_PER_HEAD = 128
+  PERCORE_BATCH_SIZE = 2
+  MAX_SEQ_LEN = 1024
+  VOCAB_SIZE = 32000
+  FPROP_DTYPE = jnp.bfloat16
+  USE_REPEATED_LAYER = True
+
+  SUMMARY_INTERVAL_STEPS = 10
+  CHECKPOINT_POLICY = layers.AutodiffCheckpointType.SAVE_NOTHING
+  ICI_MESH_SHAPE = [1, 256, 8]
