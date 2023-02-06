@@ -35,7 +35,6 @@ from absl import app
 from absl import flags
 from absl import logging
 import jax
-from jax.experimental import maps
 import numpy as np
 from paxml import base_experiment
 from paxml import experiment_registry
@@ -59,7 +58,13 @@ def _get_experiment(experiment_name: str) -> BaseExperimentT:
   """Retrieves a experiment config from the global registry."""
   experiment_class = experiment_registry.get(experiment_name)
   if experiment_class is None:
-    raise ValueError(f'Could not find experiment `{experiment_name}`.')
+    all_experiments = list(experiment_registry.get_all().keys())
+    all_names = '\n'.join(all_experiments)
+    msg = (
+        f'Could not find experiment {experiment_name}. Available experiments '
+        f'are:\n{all_names}.'
+    )
+    raise ValueError(msg)
   return experiment_class
 
 
@@ -166,9 +171,14 @@ def main(argv) -> None:
     input_specs = input_specs_provider.get_input_specs()
 
     if task_p.model.dcn_mesh_shape is not None:
-      device_mesh = py_utils.create_device_mesh(task_p.model.ici_mesh_shape,
-                                                task_p.model.dcn_mesh_shape)
-      context_manager = maps.Mesh(device_mesh, task_p.model.mesh_axis_names)
+      device_mesh = py_utils.create_device_mesh(
+          task_p.model.ici_mesh_shape,
+          task_p.model.dcn_mesh_shape,
+          contiguous_submeshes=task_p.model.contiguous_submeshes,
+      )
+      context_manager = jax.sharding.Mesh(
+          device_mesh, task_p.model.mesh_axis_names
+      )
     else:
       context_manager = contextlib.nullcontext()
 

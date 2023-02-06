@@ -1,8 +1,8 @@
 # Paxml (aka Pax)
 
 Pax is a framework to configure and run machine learning experiments on top of Jax.
-
-## Setting up a Cloud TPU VM
+## Quickstart
+### Setting up a Cloud TPU VM
 
 We refer to
 [this page](https://cloud.google.com/tpu/docs/users-guide-tpu-vm#managing_tpus)
@@ -11,27 +11,99 @@ following command is sufficient to create a Cloud TPU VM with 8 cores from a
 corp machine.
 
 ```bash
-$ TPU_NAME=pax-8
-$ gcloud alpha compute tpus tpu-vm create ${TPU_NAME} --zone us-central2-b --accelerator-type v4-8 --version v2-alpha-tpuv4 --project ${PROJECT}
+export ZONE=us-central2-b
+export VERSION=tpu-vm-v4-base
+export PROJECT=<your-project>
+export ACCELERATOR=v4-8
+export TPU_NAME=paxml
+
+#create a TPU VM
+gcloud compute tpus tpu-vm create $TPU_NAME --zone=$ZONE --version=$VERSION --project=$PROJECT --accelerator-type=$ACCELERATOR
 ```
 
 The corresponding VM instance can then be accessed via ssh.
 
 ```bash
-gcloud alpha compute tpus tpu-vm ssh ${TPU_NAME} --zone us-central2-b --project ${PROJECT}
+gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE
 ```
 
-## Installing Pax
+### Installing Pax
 
 After ssh-ing the VM, paxml can be installed using
 [pip](https://pypi.org/project/pip/).
 
 ```bash
 $ python3 -m pip install -U pip
-$ python3 -m pip install protobuf==3.15 paxml jax[tpu] \
+$ python3 -m pip install paxml jax[tpu] \
 -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 ```
 For the exact version of dependencies used to build/test each release, go to the corresponding release branch rX.Y.Z and check out `paxml/pip_package/requirements.txt`
+
+### Run a test model
+```bash
+# example model using pjit (SPMD)
+python3 .local/lib/python3.8/site-packages/paxml/main.py \
+--exp=tasks.lm.params.lm_cloud.LmCloudSpmd2BLimitSteps \
+--job_log_dir=gs://<your-bucket>
+
+# example model using pmap
+python3 .local/lib/python3.8/site-packages/paxml/main.py \
+--exp=tasks.lm.params.lm_cloud.LmCloudTransformerAdamLimitSteps \
+--job_log_dir=gs://<your-bucket> \
+--pmap_use_tensorstore=True
+```
+## Example Convergence Runs
+Here are some sample convergence runs on [c4 dataset](https://www.tensorflow.org/datasets/catalog/c4).
+
+### 1B model on c4 dataset
+
+You can run a `1B` params model on c4 dataset on TPU `v4-8`using the config `C4Spmd1BAdam4Replicas`from [c4.py](paxml/tasks/lm/params/c4.py) as follows:  
+
+```bash
+python3 .local/lib/python3.8/site-packages/paxml/main.py \
+--exp=tasks.lm.params.c4.C4Spmd1BAdam4Replicas \
+--job_log_dir=gs://<your-bucket> 
+```
+You can observe loss curve and `log perplexity` graph as follows:
+
+<img src=paxml/docs/images/1B-loss.png width="400" height="300">
+<img src=paxml/docs/images/1B-pplx.png width="400" height="300">
+
+### 16B model on c4 dataset
+
+You can run a `16B` params model on c4 dataset on TPU `v4-64`using the config `C4Spmd16BAdam32Replicas`from [c4.py](paxml/tasks/lm/params/c4.py) as follows:
+
+```bash
+python3 .local/lib/python3.8/site-packages/paxml/main.py \
+--exp=tasks.lm.params.c4.C4Spmd16BAdam32Replicas \
+--job_log_dir=gs://<your-bucket> 
+```
+You can observe loss curve and `log perplexity` graph as follows:
+
+<img src=paxml/docs/images/16B-loss.png width="400" height="300">
+<img src=paxml/docs/images/16B-pplx.png width="400" height="300">
+
+### GPT3-XL model on c4 dataset
+
+You can run the GPT3-XL model on c4 dataset on TPU `v4-128`using the config `C4SpmdPipelineGpt3SmallAdam64Replicas`from [c4.py](paxml/tasks/lm/params/c4.py) as follows:
+
+```bash
+python3 .local/lib/python3.8/site-packages/paxml/main.py \
+--exp=tasks.lm.params.c4.C4SpmdPipelineGpt3SmallAdam64Replicas \
+--job_log_dir=gs://<your-bucket> 
+```
+You can observe loss curve and `log perplexity` graph as follows:
+
+<img src=paxml/docs/images/GPT3-XL-loss.png width="400" height="300">
+<img src=paxml/docs/images/GPT3-XL-pplx.png width="400" height="300">
+
+## Benchmark on Cloud TPU v4
+The [PaLM](https://arxiv.org/abs/2204.02311) paper introduced an efficiency metric called Model FLOPs Utilization (MFU). This is measured as the ratio of the observed throughput (in, for example, tokens per second for a language model) to the theoretical maximum throughput of a system harnessing 100% of peak FLOPs. It differs from other ways of measuring compute utilization because it doesn’t include FLOPs spent on activation rematerialization during the backward pass, meaning that efficiency as measured by MFU translates directly into end-to-end training speed.
+
+To evaluate the MFU of a key class of workloads on TPU v4 Pods with Pax, we carried out an in-depth benchmark campaign on a series of decoder-only Transformer language model (GPT) configurations that range in size from billions to trillions of parameters on the [c4 dataset](https://www.tensorflow.org/datasets/catalog/c4). The following graph shows the training efficiency using the "weak scaling" pattern where we grew the model size in
+proportion to the number of chips used.
+
+<img src=paxml/docs/images/Weak_scaling_of_large_language_model_training_on_TPU_v4.png width="500" height="300">
 
 # Data inputs
 

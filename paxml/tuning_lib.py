@@ -19,7 +19,7 @@ import inspect
 import math
 import re
 
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union, Text
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union, Text, Type
 from absl import logging
 from clu import platform
 from etils import epath
@@ -67,14 +67,16 @@ def get_search_space(
   # issue.
   def inspect_search_space() -> None:
     _ = experiment_config.task()
+
     # For SeqIO data mixtures, we use a lambda function to create a search space
     # for mixture weights, however, the function will not be called until
     # the input is instantiated. Therefore we instantiate them when inspecting
-    # the search space.
+    # the search space. Currently we only inspect datasets for training.
     for d in experiment_config.datasets():
-      _ = instantiate(d)
-    for d in experiment_config.decoder_datasets():
-      _ = instantiate(d)
+      if d.is_training:
+        _ = instantiate(d)
+
+    _ = experiment_config.decoder_datasets()
 
   search_space = pg.hyper.trace(inspect_search_space, require_hyper_name=True)
   if (automl.COMBINED_DECISION_ATTR in search_space.hyper_dict
@@ -100,7 +102,8 @@ def tune(trial_fn: TrialFn,
          is_metric_reporting_role: bool = True,
          tuner_group: Optional[str] = None,
          max_num_trials: Optional[int] = None,
-         controller_mode: str = 'auto') -> None:
+         controller_mode: str = 'auto',
+         running_mode: str = 'train') -> None:
   """Tune an experiment.
 
   An experiment can be tuned by running a tuning loop, with each iteration
@@ -146,18 +149,18 @@ def tune(trial_fn: TrialFn,
       running tuning workload. If secondary, current process will only run
       tuning workload. Otherwise, current process may elect controller role
       in a background thread, and run the tuning workload in the main thread.
+    running_mode: One of 'train', 'eval', 'decode', 'decode_once' and 'infer',
+      Indicating the running mode that the worker is in.
   """
-  # Google-internal tuning infra init.
-
   search_hparams = experiment_config.search()
-  search_algorithm = instantiate(search_hparams.search_algorithm)()
-
   reward_params = search_hparams.search_reward
-  if reward_params:
-    reward_fn = instantiate(reward_params)
-  else:
-    reward_fn = None
-  max_num_trials = max_num_trials or search_hparams.max_num_trials or 1000000
+  reward_fn = instantiate(reward_params) if reward_params else None
+
+  # Make sure tuning is launched with the right running mode.
+  _verify_running_mode(reward_fn, running_mode, is_metric_reporting_role)
+
+  search_algorithm = instantiate(search_hparams.search_algorithm)()
+  max_num_trials = max_num_trials or search_hparams.max_num_trials
   errors_to_skip = search_hparams.errors_to_skip or []
   cross_step_metric_aggregator = instantiate(
       search_hparams.cross_step_metric_aggregator
@@ -200,10 +203,14 @@ def tune(trial_fn: TrialFn,
                               str(early_stopping_policy_debug_file),
                               'early_stopping_policy')
 
+  sample_kwargs = {}
+  # Google-internal tuning infra init.
+
   if controller_mode == 'primary':
     _run_dedicated_controller(
         study, search_space.dna_spec,
-        search_algorithm, early_stopping_policy, max_num_trials)
+        search_algorithm, early_stopping_policy, max_num_trials,
+        search_hparams.prior_study_ids, search_hparams.add_prior_trials)
     return
 
   sub_experiments = experiment_config.sub_experiments()
@@ -219,7 +226,8 @@ def tune(trial_fn: TrialFn,
       early_stopping_policy=early_stopping_policy,
       group=tuner_group,
       name=study if study and study.startswith('local') else None,
-      is_chief=None if controller_mode == 'auto' else False):
+      is_chief=None if controller_mode == 'auto' else False,
+      **sample_kwargs):
 
   # Google-internal tuning infra logging.
 
@@ -229,6 +237,10 @@ def tune(trial_fn: TrialFn,
     # in each trial.
     with example():
       trial_dirname = trial_dirname_generator.dirname(feedback.id)
+      if (search_hparams.add_experiment_config_to_metadata
+          and is_metric_reporting_role
+          and jax.process_index() == 0):
+        _record_experiment_config(sub_experiments, feedback)
 
       for i, (sub_experiment_id, sub_experiment_cls) in enumerate(
           sub_experiments.items()):
@@ -257,14 +269,76 @@ def tune(trial_fn: TrialFn,
   logging.info('Completed with all trials for study %r', study)
 
 
+def _record_experiment_config(
+    sub_experiments: Dict[str, Type[base_experiment.BaseExperiment]],
+    feedback: pg.tuning.Feedback) -> None:
+  """Record experiment config as trial metadata."""
+  exp_configs = {}
+  for subexp_id, subexp_cls in sub_experiments.items():
+    subexp = subexp_cls()  # pytype: disable=not-instantiable
+    exp_configs[subexp_id] = {
+        # TODO(daiyip): We shall have more machine parse-able format such as
+        # JSON or Fiddle config. But we start with raw texts to collect data
+        # as early as possible.
+        'datasets': [ds.to_text() for ds in subexp.datasets()],
+        'decoder_datasets': [
+            ds.to_text() for ds in subexp.decoder_datasets()],
+        'task': subexp.task().to_text()
+    }
+
+  feedback.set_metadata(
+      'experiment_config', {
+          # We might change the format of serialized configurations in future.
+          # It will be easy for us to filter out metadata of old format based
+          # on this format version.
+          'format_version': 1.0,
+          'source': 'pax',
+          'config': exp_configs
+      }, per_trial=True)
+
+
 def _run_dedicated_controller(
     study_name: str,
     search_space: pg.DNASpec,
     search_algorithm: pg.DNAGenerator,
     early_stopping_policy: pg.tuning.EarlyStoppingPolicy,
-    max_num_trials: Optional[int] = None) -> None:
+    max_num_trials: Optional[int] = None,
+    prior_study_ids: Optional[List[int]] = None,
+    add_prior_trials: bool = False
+    ) -> None:
   """Runs dedicated controller and waits for its completion."""
   raise NotImplementedError('Dedicated controller is not supported in OSS paxml.')
+
+
+def _verify_running_mode(
+    reward_fn: Optional[automl.BaseReward],
+    running_mode: str,
+    is_metric_reporting_role: bool) -> None:
+  """Makes sure tuning is running in the right mode and config."""
+  if reward_fn is None:
+    return
+
+  if is_metric_reporting_role:
+    if reward_fn.needs_train and running_mode != 'train':
+      raise ValueError(
+          f'Tuning uses training metrics but the reporting role is '
+          f'{running_mode!r}')
+    if reward_fn.needs_decode and running_mode not in ['train', 'decode']:
+      raise ValueError(
+          f'Tuning uses decode metrics but the reporting role is '
+          f'{running_mode!r}')
+
+  if reward_fn.needs_eval or reward_fn.needs_decode:
+    metric_type = ' and '.join(
+        x[0] for x in zip(
+            ['eval', 'decode'], [reward_fn.needs_eval, reward_fn.needs_decode])
+        if x[1])
+    logging.info(
+        'Tuning will be performed based on the %s metrics', metric_type)
+  else:
+    logging.info(
+        'Tuning will be performed based on the training metrics from the last '
+        'training step.')
 
 
 class EarlyStoppingFn:
@@ -286,6 +360,14 @@ class EarlyStoppingFn:
     self._is_metric_reporting_role = is_metric_reporting_role
     self._is_last_experiment = is_last_experiment
     self._tuning_step_start = tuning_step_start
+    if reward_fn is None:
+      self._needs_train = False
+      self._needs_eval = False
+      self._needs_decode = False
+    else:
+      self._needs_train = reward_fn.needs_train
+      self._needs_eval = reward_fn.needs_eval
+      self._needs_decode = reward_fn.needs_decode
 
   def __call__(self,
                metrics: Dict[str, float],
@@ -299,29 +381,45 @@ class EarlyStoppingFn:
       # stopping should always return False.
       if running_mode.has_eval or running_mode.has_decode:
 
-        # We only handle metric updates on main host.
-        if jax.process_index() == 0:
-          self._update_metrics(metrics, running_mode, tuning_step, is_last_ckpt)
-
-        # NOTE(daiyip): we synchronize all hosts after each eval/decode step so
-        # all of them can move to the next train step or stop uniformly. This is
-        # necessary since `sync_global_devices` will be called during
-        # checkpointing, which requires all hosts to arrive at that point with
-        # the same sequence of `sync_global_devices` calls.
-        action_str = ' and '.join(
-            [s for s, mode in zip(
-                ['evaluation', 'decoding'],
-                [running_mode.has_eval, running_mode.has_decode])])
-        py_utils.sync_global_devices(
-            f'Sync on trial {self._feedback.id} after {action_str} '
-            f'at tuning step {tuning_step}.')
+        # NOTE(daiyip): the process of updating metrics may raises errors
+        # (e.g. FloatPointError) which will be caught at higher level and
+        # treats current trial as infeasible. Nevertheless, we want to always
+        # trigger the `sync_global_devices` on all replicas uniformly here.
+        try:
+          # We only handle metric updates on main host.
+          if jax.process_index() == 0:
+            self._update_metrics(
+                metrics, running_mode, tuning_step, is_last_ckpt)
+        finally:
+          # NOTE(daiyip): we synchronize all hosts after each eval/decode step
+          # so all of them can move to the next train step or stop uniformly.
+          # This is necessary since `sync_global_devices` will be called during
+          # checkpointing, which requires all hosts to arrive at that point with
+          # the same sequence of `sync_global_devices` calls.
+          action_str = ' and '.join(
+              [s for s, mode in zip(
+                  ['evaluation', 'decoding'],
+                  [running_mode.has_eval, running_mode.has_decode])])
+          py_utils.sync_global_devices(
+              f'Sync on trial {self._feedback.id} after {action_str} '
+              f'at tuning step {tuning_step}.')
       elif is_last_ckpt:
-        if jax.process_index() == 0:
-          trial = self._feedback.get_trial()
-          if not trial.measurements:
-            self._feedback.skip(
-                f'No eval/decode has taken place before training ended. '
-                f'(trial={self._feedback.id}, step={global_step})')
+        if self._needs_eval or self._needs_decode:
+          if jax.process_index() == 0:
+            trial = self._feedback.get_trial()
+            if not trial.measurements:
+              self._feedback.skip(
+                  f'No eval/decode has taken place before training ended. '
+                  f'(trial={self._feedback.id}, step={global_step})')
+        else:
+          try:
+            if jax.process_index() == 0:
+              self._update_metrics(
+                  metrics, running_mode, tuning_step, is_last_ckpt)
+          finally:
+            py_utils.sync_global_devices(
+                f'Sync on trial {self._feedback.id} with training metrics at '
+                f'the last step {tuning_step}.')
       else:
         return False
 
@@ -688,7 +786,11 @@ class TrialDirectoryNameGenerator:
     return self._make_path_friendly(str(value))
 
   def _make_path_friendly(self, s: str) -> str:
-    return self._NON_PATH_FRIENDLY_CHAR_SET.sub('', s.replace(':', '='))
+    replacements = [(':', '='), ('[', '{'), (']', '}')]
+    for src, replacement in replacements:
+      s = s.replace(src, replacement)
+
+    return self._NON_PATH_FRIENDLY_CHAR_SET.sub('', s)
 
   def dirname(self, trial_id: int) -> epath.Path:
     """Gets the directory name for a trial."""

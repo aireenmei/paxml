@@ -25,6 +25,7 @@ import typing
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, TextIO, Tuple, Union
 
 from absl import logging
+from etils import epath
 import jax
 from jax.experimental import multihost_utils
 import jax.numpy as jnp
@@ -134,15 +135,26 @@ def _add_fake_enumeration(ex: Dict[str, Any]) -> Dict[str, Any]:
   return ex
 
 
-def _enumerate_dataset(ds: tf.data.Dataset, is_training: bool,
-                       shard_info: seqio.ShardInfo) -> tf.data.Dataset:
+def _is_padding(ex: Dict[str, Any]) -> bool:
+  return (ex[INDEX_WITHIN_SHARD_KEY] == -1 and ex[SHARD_INDEX_KEY] == -1
+          and ex[NUM_SHARDS_KEY] == -1)
+
+
+def _enumerate_dataset(
+    ds: tf.data.Dataset, is_training: bool,
+    shard_info: Optional[seqio.ShardInfo]) -> tf.data.Dataset:
   """Add enumeration fields, only meaningful when is_training=False."""
   if is_training:
     return ds.map(_add_fake_enumeration, num_parallel_calls=tf.data.AUTOTUNE)
 
   def _add_shard_enumeration(ex: Dict[str, Any]) -> Dict[str, Any]:
-    ex[SHARD_INDEX_KEY] = tf.cast(shard_info.index, tf.int32)
-    ex[NUM_SHARDS_KEY] = tf.cast(shard_info.num_shards, tf.int32)
+    shard_index, num_shards = 0, 1
+    if shard_info:
+      shard_index, num_shards = shard_info.index, shard_info.num_shards
+
+    ex[SHARD_INDEX_KEY] = tf.cast(shard_index, tf.int32)
+    ex[NUM_SHARDS_KEY] = tf.cast(num_shards, tf.int32)
+
     return ex
 
   def _fold_in_local_enumeration(index_within_shard: tf.Tensor,
@@ -156,6 +168,20 @@ def _enumerate_dataset(ds: tf.data.Dataset, is_training: bool,
               num_parallel_calls=tf.data.AUTOTUNE)
 
   return ds
+
+
+def _get_num_examples(ds: tf.data.Dataset) -> int:
+  # Iterate one-by-one instead of len(list(...)) to reduce peak memory.
+  num_examples = 0
+  for _ in ds:
+    num_examples += 1
+
+  return num_examples
+
+
+def is_packing_on(fc: seqio.FeatureConverter) -> bool:
+  """Safely checks whether a given feature converter has packing turned on."""
+  return hasattr(fc, '_pack') and fc.pack
 
 
 def maybe_update_decode_output_keys(
@@ -211,8 +237,7 @@ def maybe_update_decode_output_keys(
 
 def should_process_outputs(inp: base_input.BaseInput) -> bool:
   """Whether the current (input, process_index) pair should process outputs."""
-  return (inp.hparams.reset_for_eval and isinstance(inp, SeqIOInput)
-          and jax.process_index() == 0)
+  return (isinstance(inp, SeqIOInput) and jax.process_index() == 0)
 
 
 def process_outputs(
@@ -221,6 +246,7 @@ def process_outputs(
     summary_writer: SummaryWriter,
     metric_type: MetricType,
     step: int,
+    output_dir: epath.Path,
     verbose_entries: int = 1,
     plain_text_output_fname: Optional[str] = None) -> Dict[str, float]:
   """Computes SeqIO task-defined metric, write to TB, and returns mapping."""
@@ -229,7 +255,6 @@ def process_outputs(
 
   if metric_type is MetricType.SCORE:
     metric_name_prefix = EVAL_METRICS_PREFIX
-    # model_outputs = typing.cast(List[Mapping[str, Any]], model_outputs)
     seqio_metrics = inp.compute_metrics_eval(
         model_outputs, verbose_entries=verbose_entries)
     logging.info('Eval metrics from seqio: %s.', seqio_metrics)
@@ -248,18 +273,25 @@ def process_outputs(
     with tf.io.gfile.GFile(plain_text_output_fname, 'w') as f:
       f.write(plain_text_output.getvalue())
 
-    # Write out seqio metrics with JSON logger to JSONL file
-    logger = seqio.loggers.JSONLogger(dirname)
-    merged_seqio_metrics = {}
-    for sm in seqio_metrics:
-      merged_seqio_metrics.update(sm)
-
-    logger(task_name=inp.mixture_or_task.name, step=step,
-           metrics=merged_seqio_metrics, dataset=None, inferences=None,
-           targets=None)
-
   else:
     raise ValueError(f'unsupported metric type: {metric_type}')
+
+  # Write out seqio metrics with JSON logger to JSONL file.
+  output_dir.mkdir(parents=True, exist_ok=True)
+  logger = seqio.loggers.JSONLogger(output_dir.as_posix())
+  merged_seqio_metrics = {}
+  for sm in seqio_metrics:
+    merged_seqio_metrics.update(sm)
+
+  # JSON logger only takes MetricValue instances whereas some might be floats.
+  merged_seqio_metrics = {
+      k: seqio.metrics.Scalar(v)
+         if not isinstance(v, seqio.metrics.MetricValue) else v
+      for k, v in merged_seqio_metrics.items()
+  }
+  logger(task_name=inp.mixture_or_task.name, step=step,
+         metrics=merged_seqio_metrics, dataset=None, inferences=None,
+         targets=None)
 
   # write metrics to tensorboard
   with summary_writer.as_default():
@@ -322,30 +354,35 @@ class SeqIOInput(base_input.BaseInput):
         expected by the model, e.g. instead of "targets" we have "ids" or
         "labels" or "paddings". This also implements any necessary padding or
         packing on the data.
-      shuffle: Whether to shuffle the data. Note that None means this feature
-        is decided automatically: True for and only for non-deterministic
-        training data, otherwise False. Users can override this by setting this
+      shuffle: Whether to shuffle the data. Note that None means this feature is
+        decided automatically: True for and only for non-deterministic training
+        data, otherwise False. Users can override this by setting this
         explicitly.
       repeat: Whether to repeat the data. Note that None means this feature is
-        decided automatically: True for and only for non-deterministic training
-        data, otherwise False. Users can override this by setting this field
+        decided automatically: True only for non-deterministic training data,
+        otherwise False. Users can override this by setting this field
         explicitly.
-      use_cached: Whether to read from the cached directory, if supported by
-        the underlying SeqIO task/mixture. Users can set to False to test out
-        data changes before the cache is applied.
+      use_cached: Whether to read from the cached directory, if supported by the
+        underlying SeqIO task/mixture. Users can set to False to test out data
+        changes before the cache is applied.
       trim_output_features: If True, it trims output features to be less than
         the length given by `sequence_length`.
       eval_auto_pad: Only used when p.is_training=False. Automatically pad the
         data to multiples of global batch size, using the first example in the
         data. Padded entries will have batch_input.eval_sample_weight == 0.0.
+      drop_remainder: Whether to drop remaining examples from the last partial
+        batch.
+      num_batches_to_skip: If not None, skip given number of batches in the
+        dataset, to avoid reusing data after restaring the training process.
+        Only affects training.
       deterministic_input_start_index: Params to compute the starting example
         index. Used only if the data is a deterministic input, otherwise
         ignored.
       eval_metrics_targets_length: typically when used in eval, the data
         returned by get_next() would not contain any targets.
-        eval_metrics_targets_length overrides the task feature lengths
-        for targets when processing the targets as ground truths to compute
-        eval metrics. It has no effect on get_next(), but only affects
+        eval_metrics_targets_length overrides the task feature lengths for
+        targets when processing the targets as ground truths to compute eval
+        metrics. It has no effect on get_next(), but only affects
         compute_metrics(). If set to None, won't truncate.
       use_enumeration: whether to use enumeration in both batch generation
         (get_next()) and metrics computation. When this param is set to True,
@@ -356,6 +393,10 @@ class SeqIOInput(base_input.BaseInput):
         `process_decode_out` the key in the sequence of tuples should be the
         enumerated index. At metrics computation time, we'll join the enumerated
         index.
+      annotate_padding_fields: whether to manually update the `.weights` and
+        `.padding` fields for examples. It is preferable that users use
+        `.eval_sample_weights` field that gets set to `=0` for padded eval
+        examples.
     """
     # Required params.
     mixture_name: Optional[str] = None
@@ -363,13 +404,15 @@ class SeqIOInput(base_input.BaseInput):
     split_name: Optional[str] = None
     deterministic_input: bool = False
     task_feature_lengths: Optional[Mapping[str, int]] = None
-    feature_converter: seqio.FeatureConverter = None
+    feature_converter: Optional[seqio.FeatureConverter] = None
     # Optional params.
     shuffle: Optional[bool] = None
     repeat: Optional[bool] = None
     use_cached: bool = False
     eval_auto_pad: bool = True
-    # trim_output_features flag allow passing this arg to seqio.get_datset
+    drop_remainder: bool = True
+    num_batches_to_skip: Optional[int] = None
+    # trim_output_features flag allow passing this arg to seqio.get_dataset
     # the default value is True so this change will not affect any current
     # behaviour. the main purpose is for prefixlm to not problematically
     # pack on the inputs.
@@ -382,14 +425,17 @@ class SeqIOInput(base_input.BaseInput):
         sub_config_field(lazy_ref=lambda: SeqIOInput.DeterministicInputParams))
     eval_metrics_targets_length: Optional[int] = None
     use_enumeration: bool = False
+    annotate_padding_fields: bool = False
 
   def __init__(self, hparams: ParamsT) -> None:
     # Modify hparams in-place before freezing hparams
     if not hparams.name:
-      hparams.name = f'{hparams.mixture_name}_{hparams.split_name}'
-    if hparams.input_random_seed is None and hparams.use_enumeration:
+      mixture_name = hparams.mixture_name or hparams.mixture_or_task.name
+      hparams.name = f'{mixture_name}_{hparams.split_name}'
+    if (not hparams.is_training and hparams.input_random_seed is None
+        and hparams.use_enumeration):
       # Since we want the enumeration to be deterministic, in the case that
-      # there's no explicit seed set, we default to a fixed seed
+      # there's no explicit seed set, we default to a fixed seed for evals.
       hparams.input_random_seed = 42
 
     super().__init__(hparams)
@@ -401,32 +447,15 @@ class SeqIOInput(base_input.BaseInput):
     # calls to it short circuit by returning the cached values.
     self._cached_targets_with_enum_key: Optional[Mapping[str, NestedMap]] = None
 
+    self.is_targets_init = False
+
   def _validate_deterministic(self):
     if self.hparams.deterministic_input:
       raise ValueError('deterministic_input is not supported')
 
-  def _validate_compute_metrics_config(self, raise_exception: bool):
-    """Computing metrics with eval_loop_num_batches is not supported."""
-    p = self.hparams
-    # eval_loop_num_batches gets ignored if reset_for_eval is True
-    if not (not p.is_training
-            and not p.reset_for_eval
-            and p.eval_loop_num_batches is not None):
-      return
-
-    message = (
-        'eval_loop_num_batches is not supported for eval SeqIOInput when '
-        'computing metrics - both self.compute_metrics() and '
-        'self.compute_metrics_eval() will fail if called')
-    if raise_exception:
-      raise ValueError(message)
-    else:
-      logging.info(message)
-
   def _validate_eval_task(self):
     assert isinstance(self.mixture_or_task, seqio.Task)
     p = self.hparams
-
     # weights_on_targets_only must be true if computing scoring metric fns and
     # using LanguageModelFeatures as feature converter.
     if (self.mixture_or_task.score_metric_fns
@@ -449,20 +478,28 @@ class SeqIOInput(base_input.BaseInput):
           'SeqIO input hparams p.is_training=True but p.split_name is '
           'not "train" but p.split_name=%s', p.split_name)
 
-    # Not raising during construction since some users don't compute metrics
-    self._validate_compute_metrics_config(raise_exception=False)
-
-    self._mixture_or_task = p.mixture_or_task or seqio.get_mixture_or_task(
+    self._mixture_or_task_inst = p.mixture_or_task or seqio.get_mixture_or_task(
         p.mixture_name)
     shard_info = seqio.ShardInfo(
-        index=p.infeed_host_index, num_shards=p.num_infeed_hosts)
-    logging.info('ShardInfo: shard_id: %d, num_shards: %d, ', shard_info.index,
-                 shard_info.num_shards)
+        index=p.infeed_host_index, num_shards=p.num_infeed_hosts
+    )
+    logging.info(
+        'ShardInfo for %s: shard_id: %d, num_shards: %d, ',
+        self._mixture_or_task_inst.name,
+        shard_info.index,
+        shard_info.num_shards,
+    )
     self._shard_info = shard_info
     self._validate_deterministic()
 
     if not p.is_training and isinstance(self.mixture_or_task, seqio.Task):
       self._validate_eval_task()
+
+    if p.eval_loop_num_batches is None and p.repeat:
+      raise ValueError(
+          'Dataset has eval_loop_num_batches set to None while repeat is True. '
+          'This would lead to an endless eval.'
+      )
 
   @property
   def is_deterministic(self) -> bool:
@@ -487,7 +524,23 @@ class SeqIOInput(base_input.BaseInput):
 
   @property
   def mixture_or_task(self) -> Union[seqio.Task, seqio.Mixture]:
-    return self._mixture_or_task
+    return self._mixture_or_task_inst
+
+  def _get_num_eval_examples(self) -> int:
+    """Returns the number of eval examples.
+
+    Corresponds to`eval_loop_num_batches` when reset_for_eval=True;
+    otherwise eval runs on full dataset.
+    """
+    p = self.hparams
+    if (
+        not p.is_training
+        and p.batch_size
+        and p.eval_loop_num_batches
+        and not p.reset_for_eval
+    ):
+      return p.eval_loop_num_batches * p.batch_size * p.num_infeed_hosts
+    return -1
 
   def _get_dataset(self) -> tf.data.Dataset:
     p = self.hparams
@@ -501,8 +554,107 @@ class SeqIOInput(base_input.BaseInput):
         shard_info=self._shard_info)
     ds = self._pad_to_batch_size(ds)
     ds = ds.batch(
-        p.batch_size, drop_remainder=True, num_parallel_calls=tf.data.AUTOTUNE)
+        p.batch_size,
+        drop_remainder=p.drop_remainder,
+        num_parallel_calls=tf.data.AUTOTUNE,
+    )
+    if p.num_batches_to_skip:
+      if p.is_training:
+        ds = ds.skip(p.num_batches_to_skip)
+      else:
+        logging.warning(
+            "num_batches_to_skip set tp '%d' but has no effect because "
+            "is_training is false", p.num_batches_to_skip)
+
     return ds
+
+  def _gen_targets_dataset(self):
+    p = self.hparams
+    self._len_full_ds = 0
+    inputs_length = p.task_feature_lengths['inputs']
+    # if set, p.eval_metrics_targets_length
+    # overrides p.task_feature_lengths['targets']
+    targets_length = (
+        p.eval_metrics_targets_length
+        if p.eval_metrics_targets_length
+        else p.task_feature_lengths['targets']
+    )
+    sharded_datasets = []
+    sharded_datasets_converted = []
+
+    largest_shard = 0
+    for host_idx in range(p.num_infeed_hosts):
+      shard_info = seqio.ShardInfo(
+          index=host_idx, num_shards=p.num_infeed_hosts
+      )
+      ds_shard = self.mixture_or_task.get_dataset(
+          sequence_length={'inputs': inputs_length,
+                           'targets': targets_length},
+          split=p.split_name,
+          shuffle=False,
+          num_epochs=1,
+          shard_info=shard_info,
+          seed=p.input_random_seed,
+          use_cached=p.use_cached,
+          trim_output_features=p.trim_output_features
+      )
+      if p.use_enumeration:
+        ds_shard = _enumerate_dataset(
+            ds_shard, p.is_training, shard_info
+        )
+      else:
+        sharded_datasets_converted.append(
+            p.feature_converter(ds_shard, p.task_feature_lengths))
+      shard_num_examples = _get_num_examples(ds_shard)
+      if shard_num_examples > largest_shard:
+        largest_shard = shard_num_examples
+      logging.info('Targets shard %d/%d has %d examples',
+                   host_idx, p.num_infeed_hosts, shard_num_examples)
+      self._len_full_ds += shard_num_examples
+      sharded_datasets.append(ds_shard)
+
+    # Interleave sharded dataset so it can be read sequentially on
+    # single host. The shards may be uneven so we need to repeat based on the
+    # largest shard to avoid missing any data.
+    choice_dataset = tf.data.Dataset.range(p.num_infeed_hosts).repeat(
+        largest_shard
+    )
+    self.targets_ds = tf.data.experimental.choose_from_datasets(
+        sharded_datasets, choice_dataset
+    )
+    if not p.use_enumeration:
+      self.targets_ds_converted = tf.data.experimental.choose_from_datasets(
+          sharded_datasets_converted, choice_dataset
+      )
+
+  def _gen_filtered_artifacts(self) -> None:
+    """Create filtered targets artifacts."""
+    (
+        self.targets_ds,
+        self.targets_ds_ori,
+        self.ds_non_ragged_tensor_keys,
+        self.ds_ragged_tensor_keys,
+    ) = self._filter_ragged_tensor(self.targets_ds)
+
+  def _gen_targets_iter(self) -> None:
+    """Generate targets iterator."""
+    p = self.hparams
+    self.targets_iter = self.targets_ds.as_numpy_iterator()
+    if not p.use_enumeration:
+      self.targets_iter_converted = (
+          self.targets_ds_converted.as_numpy_iterator()
+      )
+    # Create iterator for ori_targets_ds, which may have ragged tensors and thus
+    # can't safely be called with `as_numpy_iterator()`
+    # (see `_filter_ragged_tensor()`)
+    self.targets_iter_ori = iter(self.targets_ds_ori)
+
+  def _gen_targets_artifacts(self):
+    self._num_eval_examples = self._get_num_eval_examples()
+    self._gen_targets_dataset()
+    self._gen_filtered_artifacts()
+    self._gen_targets_iter()
+    self.is_targets_init = True
 
   def get_next(self) -> NestedNpTensor:
     return next(self._iter)
@@ -547,7 +699,6 @@ class SeqIOInput(base_input.BaseInput):
         use_cached=p.use_cached,
         seed=p.input_random_seed,
         trim_output_features=p.trim_output_features)
-
     ds = p.feature_converter(ds, task_feature_lengths=p.task_feature_lengths)
 
     if p.use_enumeration:
@@ -581,14 +732,23 @@ class SeqIOInput(base_input.BaseInput):
       return b
 
     def _add_pad(b):
+      if not isinstance(b, py_utils.NestedMap):
+        b = py_utils.NestedMap.FromNestedDict(b)
       b.eval_sample_weights = 0.0
       if p.use_enumeration:
         b = _add_fake_enumeration(b)
+      if p.annotate_padding_fields and hasattr(b, 'weights'):
+        b.weights *= 0
+        if hasattr(b, 'paddings'):
+          b.paddings = 1 - b.weights
       return b
 
     ds = ds.map(_add_weight)
     p = self.hparams
-    if p.is_training or not p.reset_for_eval or not p.eval_auto_pad:
+    if (p.is_training or
+        not p.reset_for_eval or
+        not p.eval_auto_pad or
+        self.repeat):
       return ds
 
     # p.reset_for_eval=True: We are running eval over exactly one epoch.
@@ -601,7 +761,7 @@ class SeqIOInput(base_input.BaseInput):
     # the underlying eval dataset stays unchanged across different iterations
     # of epochs.
     ds = ds.cache()
-    local_num = len(list(ds.as_numpy_iterator()))
+    local_num = _get_num_examples(ds)
     local_num_batches = (local_num + p.batch_size - 1) // p.batch_size
     # Find the max number of batches required across all Jax processes.
     num_batches_all = multihost_utils.process_allgather(
@@ -616,6 +776,31 @@ class SeqIOInput(base_input.BaseInput):
     pad_ds = self._get_one_example_ds(ds).map(_add_pad).repeat(pad_num)
     return ds.concatenate(pad_ds)
 
+  def _filter_ragged_tensor(self, targets_ds: tf.data.Dataset) -> Tuple[
+      tf.data.Dataset, tf.data.Dataset, List[str], List[str]]:
+    # customized input may contain ragged tensor, which may cause errors in
+    # decoding when calling 'as_numpy_iterator()' below. We filter out
+    # RaggedTensor here.
+    ds_ragged_tensor_keys = []
+    ds_non_ragged_tensor_keys = []
+    for ds_element_key, ds_element_value in targets_ds.element_spec.items():
+      if isinstance(ds_element_value, tf.RaggedTensorSpec):
+        ds_ragged_tensor_keys.append(ds_element_key)
+      else:
+        ds_non_ragged_tensor_keys.append(ds_element_key)
+    # keep the original target ds before filtering because if inputs is a
+    # ragged tensor, we need both the inputs and targets_pretokenized.
+    ori_targets_ds = targets_ds
+    targets_ds = targets_ds.map(
+        lambda x: {i: x[i] for i in ds_non_ragged_tensor_keys}
+    )
+    return (
+        targets_ds,
+        ori_targets_ds,
+        ds_non_ragged_tensor_keys,
+        ds_ragged_tensor_keys,
+    )
+
   def _build_predict_metric_inputs_with_prefix(
       self, answers: Dict[str, NestedMap], verbose_entries: int,
       plain_text_output: Optional[TextIO] = None) -> Tuple[
@@ -624,47 +809,53 @@ class SeqIOInput(base_input.BaseInput):
     # TODO(b/241386390): deprecate prefix-based matching for metrics computation
     p = self.hparams
     assert not p.use_enumeration
-
+    assert self.targets_ds
     # Prepare ground truth label data by dumping out seqio eval dataset and
     # get a dict key-ed by detokenized inputs (tokenized inputs are truncated
     # to inputs_length).
     inputs_length = p.task_feature_lengths['inputs']
-    targets_length = p.eval_metrics_targets_length
-    targets_ds = self.mixture_or_task.get_dataset(
-        sequence_length={
-            'inputs': inputs_length,
-            'targets': targets_length,
-        },
-        split=p.split_name,
-        shuffle=False,
-        num_epochs=1,
-        seed=p.input_random_seed,
-        use_cached=p.use_cached,
-        trim_output_features=p.trim_output_features)
-
-    # customized input may contain ragged tensor, which may cause errors in
-    # decoding when calling 'as_numpy_iterator()' below. We filter out
-    # RaggedTensor here.
-    ds_non_ragged_element_keys = []
-    for ds_element_key, ds_element_value in targets_ds.element_spec.items():
-      if not isinstance(ds_element_value, tf.RaggedTensorSpec):
-        ds_non_ragged_element_keys.append(ds_element_key)
-    targets_ds = targets_ds.map(
-        lambda x: {i: x[i] for i in ds_non_ragged_element_keys})
+    assert inputs_length is not None
 
     # Note that lists are used per prefix since there may be duplicates
     targets = collections.defaultdict(list)
     examples = collections.defaultdict(list)
-    for e in targets_ds.as_numpy_iterator():
+    num_examples = 0
+    while (
+        self._num_eval_examples < 0
+        or num_examples < self._num_eval_examples
+    ):
+      num_examples += 1
+      try:
+        example = next(self.targets_iter)
+        if 'inputs' not in self.ds_non_ragged_tensor_keys:
+          example_orig = next(self.targets_iter_ori)
+      except (tf.errors.OutOfRangeError, StopIteration) as exc:
+        if self._num_eval_examples > 0:
+          raise Exception(
+              'Exhausted eval data with reset_for_eval=False after'
+              f' {num_examples-1} examples (batch_size={p.batch_size})'
+          ) from exc
+        logging.info('Exhausted eval data after %d steps', num_examples - 1)
+        self._gen_targets_iter()
+        break
+
       # Note that we intentionally do not use 'inputs_pretokenized' here because
       # it might be very different from the round-trip results below, which
       # wouldn't match with the keys we get from the model inference path.
-      key = self.ids_to_strings(e['inputs'][np.newaxis, :],
-                                lengths=[inputs_length], key='src')[0]
-      t = _get_targets_str(e, self.mixture_or_task)
+      if 'inputs' in self.ds_non_ragged_tensor_keys:
+        inputs = example['inputs'][np.newaxis, :]
+      else:
+        # ragged tensor may have multiple elements of various lengths. We
+        # linearize all inputs into one array.
+        assert (
+            'inputs' in example_orig
+        ), '"inputs" field is required but not found'
+        inputs = example_orig['inputs'].flat_values.numpy()[np.newaxis, :]
+      key = self.ids_to_strings(inputs, lengths=[inputs_length], key='src')[0]
+      t = _get_targets_str(example, self.mixture_or_task)
       targets[key].append(self.mixture_or_task.postprocess_fn(
-          t, example=e, is_target=True))
-      examples[key].append(e)
+          t, example=example, is_target=True))
+      examples[key].append(example)
 
     # In case the prefix returned by the model are prefixes of the keys
     # re-constructed here. This can sometimes be needed due to truncation of
@@ -691,12 +882,19 @@ class SeqIOInput(base_input.BaseInput):
 
       # Mutate 'ans' dictionary which is written to disk afterwards
       ans['seqio_targets'] = targets[k]
-      ans['seqio_postprocessed_predictions'] = (
-          _convert_bytes_to_str(seqio_postprocessed_predictions))
-
-    eval_data_size = len(list(targets_ds.as_numpy_iterator()))
-    logging.info('Data %s has %s examples for computing eval metrics.', p.name,
-                 eval_data_size)
+      ans['seqio_postprocessed_predictions'] = _convert_bytes_to_str(
+          seqio_postprocessed_predictions
+      )
+    eval_data_size = (
+        self._num_eval_examples
+        if self._num_eval_examples > 0
+        else self._len_full_ds
+    )
+    logging.info(
+        'Data %s has %s examples for computing eval metrics.',
+        p.name,
+        eval_data_size,
+    )
     if eval_data_size != len(predictions_list):
       raise ValueError(
           f'Data {p.name} expects {eval_data_size} examples for computing eval'
@@ -725,41 +923,50 @@ class SeqIOInput(base_input.BaseInput):
     return predictions_list, targets_list
 
   def _get_targets_with_enum_key(self) -> Mapping[str, NestedMap]:
+    assert self.targets_ds
     if self._cached_targets_with_enum_key is not None:
       return self._cached_targets_with_enum_key
-
     p = self.hparams
-    inputs_length = p.task_feature_lengths['inputs']
-    targets_length = p.eval_metrics_targets_length
-
     targets = {}
-    # simulate multi-host setup by iterating on multiple input generators
-    for host_idx in range(p.num_infeed_hosts):
-      shard_info = seqio.ShardInfo(
-          index=host_idx, num_shards=p.num_infeed_hosts)
-      targets_ds = self.mixture_or_task.get_dataset(
-          sequence_length={
-              'inputs': inputs_length,
-              'targets': targets_length,
-          },
-          split=p.split_name,
-          shuffle=False,
-          num_epochs=1,
-          shard_info=shard_info,
-          seed=p.input_random_seed,
-          use_cached=p.use_cached,
-          trim_output_features=p.trim_output_features)
-      targets_ds = _enumerate_dataset(targets_ds, False, shard_info)
+    num_examples = 0
+    while (
+        self._num_eval_examples < 0
+        or num_examples < self._num_eval_examples
+    ):
+      num_examples += 1
+      try:
+        example = next(self.targets_iter)
+        if self.ds_ragged_tensor_keys:
+          example_orig = next(self.targets_ds_ori)
+      except (tf.errors.OutOfRangeError, StopIteration) as exc:
+        if self._num_eval_examples > 0:
+          raise Exception(
+              'Exhausted eval data with reset_for_eval=False after'
+              f' {num_examples-1} examples (batch_size={p.batch_size})'
+          ) from exc
+        logging.info(
+            'Exhausted target eval data after %d examples', num_examples - 1
+        )
+        self._gen_targets_iter()
+        break
 
-      for e in targets_ds.as_numpy_iterator():
-        # remove enum related fields from example as seqio metric_fns API
-        # expects the output from the task dataset directly.
-        key = py_utils.get_enumeration_id(e, pop=True)
-        assert key is not None and key not in targets
-        targets[key] = e
+      # remove enum related fields from example as seqio metric_fns API
+      # expects the output from the task dataset directly.
+      key = py_utils.get_enumeration_id(example, pop=True)
+      assert key is not None and key not in targets
+      targets[key] = example
 
-    self._cached_targets_with_enum_key = targets  # populate cache
+      # we keep the ragged tensors and add them into the targets.
+      # ragged tensor may have multiple elements of various lengths. We
+      # linearize all inputs into one array.
+      for field in self.ds_ragged_tensor_keys:
+        field_value = example_orig[field]
+        linearized_field_value = field_value.flat_values.numpy()
+        linearized_field_value = linearized_field_value[np.newaxis, :]
+        targets[key][field] = linearized_field_value
 
+    if p.reset_for_eval:
+      self._cached_targets_with_enum_key = targets  # populate cache
     return targets
 
   def _build_predict_metric_inputs_with_enum(
@@ -825,24 +1032,33 @@ class SeqIOInput(base_input.BaseInput):
       verbose_entries: int) -> Tuple[Sequence[Any], Sequence[Any]]:
     """Build 1-to-1 mapped scores and targets for metrics via label matching."""
     # TODO(b/241386390): deprecate label-based matching for metrics computation.
+    assert self.targets_ds
     p = self.hparams
     # Prepare ground truth label data by dumping out seqio eval dataset and
     # produce a dict key-ed by tuple of `labels` token ids.
-    targets_ds = self.mixture_or_task.get_dataset(
-        sequence_length=p.task_feature_lengths,
-        split=p.split_name,
-        shuffle=False,
-        num_epochs=1,
-        seed=p.input_random_seed,
-        use_cached=p.use_cached,
-        trim_output_features=p.trim_output_features)
-    converted_targets_ds = p.feature_converter(targets_ds,
-                                               p.task_feature_lengths)
     targets = collections.defaultdict(list)
-    for example, converted_example in zip(
-        targets_ds.as_numpy_iterator(),
-        converted_targets_ds.as_numpy_iterator()):
-      key = tuple(converted_example[_LM_LABEL_KEY])
+    num_examples = 0
+    while (
+        self._num_eval_examples < 0
+        or num_examples < self._num_eval_examples
+    ):
+      num_examples += 1
+      try:
+        example = next(self.targets_iter)
+        example_convert = next(self.targets_iter_converted)
+      except (tf.errors.OutOfRangeError, StopIteration) as exc:
+        if self._num_eval_examples > 0:
+          raise Exception(
+              'Exhausted eval data with reset_for_eval=False after'
+              f' {num_examples-1} examples (batch_size={p.batch_size})'
+          ) from exc
+        logging.info(
+            'Exhausted target eval data after %d examples', num_examples - 1
+        )
+        self._gen_targets_iter()
+        break
+
+      key = tuple(example_convert[_LM_LABEL_KEY])
       targets[key].append(example)
 
     # Construct (scoring output, seqio target) lists by joining on label tokens
@@ -856,10 +1072,12 @@ class SeqIOInput(base_input.BaseInput):
       ans = answers[k]
       target = targets[k]
       score = ans[_LM_SCORE_KEY]
+      prefix_targets_list = []
       for e in targets[k]:
         target_post = self.mixture_or_task.postprocess_fn(
             target, example=e, is_target=True)
         targets_list.append(target_post)
+        prefix_targets_list.append(target_post)
         scores_list.append(score)
         if verbose_entries_idx < verbose_entries:
           logging.info(
@@ -869,10 +1087,19 @@ class SeqIOInput(base_input.BaseInput):
               e.get('targets_pretokenized', 'None'), e.get('is_correct', 'N/A'),
               target_post, score)
           verbose_entries_idx += 1
-
-    eval_data_size = len(list(targets_ds.as_numpy_iterator()))
-    logging.info('Data %s has %s examples for computing eval metrics.', p.name,
-                 eval_data_size)
+      ans['seqio_postprocessed_targets'] = _convert_bytes_to_str(
+          prefix_targets_list
+      )
+    eval_data_size = (
+        self._num_eval_examples
+        if self._num_eval_examples > 0
+        else self._len_full_ds
+    )
+    logging.info(
+        'Data %s has %s examples for computing eval metrics.',
+        p.name,
+        eval_data_size,
+    )
     if eval_data_size != len(scores_list):
       raise ValueError(
           f'Data {p.name} expects {eval_data_size} examples for computing eval'
@@ -909,6 +1136,7 @@ class SeqIOInput(base_input.BaseInput):
             example.get('targets_pretokenized', 'None'),
             example.get('is_correct', 'N/A'), target_post, score)
         verbose_entries_idx += 1
+      ans['seqio_postprocessed_targets'] = _convert_bytes_to_str(target_post)
 
     return scores_list, targets_list
 
@@ -961,16 +1189,17 @@ class SeqIOInput(base_input.BaseInput):
     p = self.hparams
     task = self.mixture_or_task
     if not isinstance(task, seqio.Task):
-      raise ValueError('compute_metrics() is only supported for seqio.Tasks, '
-                       f'got {type(self.mixture_or_task)} for {p.name}.')
-
+      logging.warning('compute_metrics is only supported for seqio.Tasks, '
+                      'got %s for %s.', type(task), p.name)
+      return []
     # If there are no seqio decode/predict metrics to compute return empty list
     if not task.predict_metric_fns:
-      logging.info('no predict_metric_fns defined on task: %s',
-                   self.mixture_or_task.name)
+      logging.info('no predict_metric_fns defined on task: %s', task.name)
       return []
-
-    self._validate_compute_metrics_config(raise_exception=True)
+    if is_packing_on(p.feature_converter):
+      logging.error('Will not compute metrics on %s since using a '
+                    'FeatureConverter with pack=True.', task.name)
+      return []
 
     if not decoder_outputs:
       return []
@@ -980,6 +1209,10 @@ class SeqIOInput(base_input.BaseInput):
            'the key was not found in decoder_outputs (b/244434890)'),
           _LM_DECODER_OUT_KEY)
       return []
+
+    # Create targets artifacts if they don't exist yet
+    if not self.is_targets_init:
+      self._gen_targets_artifacts()
 
     answers = dict(decoder_outputs)
     if p.use_enumeration:
@@ -1039,15 +1272,17 @@ class SeqIOInput(base_input.BaseInput):
     p = self.hparams
     task = self.mixture_or_task
     if not isinstance(task, seqio.Task):
-      raise ValueError(
+      logging.warning(
           'compute_metrics_eval() is only supported for seqio.Tasks, '
-          f'got {type(self.mixture_or_task)} for {p.name}.')
-    if not task.score_metric_fns:
-      logging.info('no score_metric_fns defined on task: %s',
-                   self.mixture_or_task.name)
+          'got %s for %s.', type(task), p.name)
       return []
-
-    self._validate_compute_metrics_config(raise_exception=True)
+    if not task.score_metric_fns:
+      logging.info('no score_metric_fns defined on task: %s', task.name)
+      return []
+    if is_packing_on(p.feature_converter):
+      logging.error('Will not compute metrics on %s since using a '
+                    'FeatureConverter with pack=True.', task.name)
+      return []
 
     if not eval_outputs:
       return []
@@ -1058,8 +1293,12 @@ class SeqIOInput(base_input.BaseInput):
           _LM_SCORE_KEY)
       return []
 
+    # Create targets artifacts if they don't exist yet
+    if not self.is_targets_init:
+      self._gen_targets_artifacts()
+
     if p.use_enumeration:
-      answers = dict(eval_outputs)
+      answers = dict([(k, v) for k, v in eval_outputs if not _is_padding(v)])
       scores_list, targets_list = self._build_scoring_metric_inputs_with_enum(
           answers, verbose_entries)
     else:
@@ -1087,7 +1326,8 @@ class SeqIOInput(base_input.BaseInput):
 ###############################################################################
 
 
-class LanguageModelFeatures(seqio.DecoderFeatureConverter):
+class LanguageModelFeatures(seqio.DecoderFeatureConverter,
+                            base_hyperparams.StrOverride):
   """A feature converter for a language model.
 
   The output nested map for each map contains:
@@ -1121,12 +1361,16 @@ class LanguageModelFeatures(seqio.DecoderFeatureConverter):
     ```
   """
 
-  def __init__(self,
-               pack: bool = False,
-               use_custom_packing_ops: bool = False,
-               weights_on_targets_only: Optional[bool] = None,
-               apply_length_check: bool = True,
-               bos_id: int = 0) -> None:
+  def __init__(
+      self,
+      pack: bool = False,
+      use_custom_packing_ops: bool = False,
+      weights_on_targets_only: Optional[bool] = None,
+      apply_length_check: bool = True,
+      bos_id: int = 0,
+      reverse_bos_padding: bool = False,
+      eos_id: int = 1,
+  ) -> None:
     """Args to construct a language model feature converter.
 
     Args:
@@ -1144,8 +1388,18 @@ class LanguageModelFeatures(seqio.DecoderFeatureConverter):
         less than the lengths given by `sequence_length` in the get_dataset
         function.
       bos_id: bos id for decoder inputs.
+      reverse_bos_padding: Whether to reverse the bos_id padding, and pad
+        to the end of labels with eos_id instead.
+      eos_id: eos id for decoder inputs, only in effect if reverse_bos_padding
+        true.
     """
+    self._pack = pack
+    self._use_custom_packing_ops = use_custom_packing_ops
     self._weights_on_targets_only = weights_on_targets_only
+    self._apply_length_check = apply_length_check
+    self._bos_id = bos_id
+    self._reverse_bos_padding = reverse_bos_padding
+    self._eos_id = eos_id
     super().__init__(
         loss_on_targets_only=True,
         pack=pack,
@@ -1153,9 +1407,37 @@ class LanguageModelFeatures(seqio.DecoderFeatureConverter):
         apply_length_check=apply_length_check,
         bos_id=bos_id)
 
+  def __str__(self) -> str:
+    return (
+        f'{self.__class__.__name__}(pack={self._pack}, '
+        f'use_custom_packing_ops={self._use_custom_packing_ops}, '
+        f'weights_on_targets_only={self._weights_on_targets_only}, '
+        f'apply_length_check={self._apply_length_check}, '
+        f'bos_id={self._bos_id},'
+        f'reverse_bos_padding={self._reverse_bos_padding},'
+        f'eos_id={self._eos_id})'
+    )
+
   @property
   def weights_on_targets_only(self) -> bool:
     return self._weights_on_targets_only
+
+  def _shift_left_and_pad(self, tensor, pad_val):
+    # Expand dims here so that the below code can work with 1-d tensors.
+    v = tf.expand_dims(tensor, 0)
+    # Make sure we keep tensor as ragged to allow for uneven concat.
+    if isinstance(v, tf.Tensor):
+      v = tf.RaggedTensor.from_tensor(v)
+
+    # Append padding to the last item of every sequence.
+    pad_shape = tf.concat([v.bounding_shape()[:-2], [1, 1]], axis=0)
+    pad_tensor = tf.broadcast_to(pad_val, pad_shape)
+    last_in_sequence = tf.concat([v[..., -1:, 1:], pad_tensor], axis=-1)
+    # Concat back the newly modified final sequence item.
+    v = tf.concat([v[..., :-1, :], last_in_sequence], axis=-2)
+    # Un-expand outer dimension.
+    v = v[0]
+    return v
 
   def _to_pax(self, b) -> NestedMap:
     """Change data format for a Pax LanguageModel."""
@@ -1193,6 +1475,13 @@ class LanguageModelFeatures(seqio.DecoderFeatureConverter):
 
     ret.ids = tf.math.abs(ret.ids)
     ret.labels = tf.math.abs(ret.labels)
+
+    if self._reverse_bos_padding:
+      ret.ids = ret.labels
+      ret.labels = self._shift_left_and_pad(ret.labels, self._eos_id)
+      ret.weights = self._shift_left_and_pad(ret.weights, 0.0)
+      ret.paddings = self._shift_left_and_pad(ret.paddings, 1.0)
+
     return ret
 
   def __call__(self, ds: tf.data.Dataset,
@@ -1235,9 +1524,17 @@ class SequenceModelFeatures(seqio.EncDecFeatureConverter):
                pack: bool = False,
                use_custom_packing_ops: bool = False,
                bos_id: int = 0) -> None:
+    self._pack = pack
+    self._use_custom_packing_ops = use_custom_packing_ops
+    self._bos_id = bos_id
     super().__init__(pack=pack,
                      use_custom_packing_ops=use_custom_packing_ops,
                      bos_id=bos_id)
+
+  def __str__(self) -> str:
+    return (f'{self.__class__.__name__}(pack={self._pack}, '
+            f'use_custom_packing_ops={self._use_custom_packing_ops}, '
+            f'bos_id={self._bos_id})')
 
   def _to_pax(self, b) -> NestedMap:
     """Change data format for a Pax SequenceModel."""
@@ -1377,6 +1674,8 @@ def get_eval_hparams_for_seqio(
     num_infeed_hosts: int = 0,
     use_enumeration: bool = False,
     use_cached: bool = False,
+    shuffle: bool = None,
+    require_metric_fns: bool = True,
 ) -> list[SeqIOInput.HParams]:
   """Returns a list of `SeqIOInput.HParams` for SeqIO Task/Mixture for eval.
 
@@ -1392,7 +1691,7 @@ def get_eval_hparams_for_seqio(
   >>>   batch_size = 32
   >>>   feature_lengths={'inputs': 1024, 'targets': 256}
   >>>   seed = 75303
-  >>>   return create_eval_hparams_for_seqio(
+  >>>   return get_eval_hparams_for_seqio(
   >>>       mixture_name, batch_size, feature_lengths, MetricType.PREDICT, seed)
 
   Args:
@@ -1418,6 +1717,8 @@ def get_eval_hparams_for_seqio(
     use_enumeration: whether to use enumeration in both batch generation
       (get_next()) and metrics computation. For details, see SeqIOInput.HParams.
     use_cached: whether to use cached data.
+    shuffle: whether to shuffle data.
+    require_metric_fns: whether to require that SeqIO tasks have metric_fns.
   """
   if not feature_converter:
     weights_on_targets_only = True if metric_type is MetricType.SCORE else False
@@ -1430,6 +1731,7 @@ def get_eval_hparams_for_seqio(
       is_training=False,
       eval_loop_num_batches=None,
       reset_for_eval=True,
+      shuffle=shuffle,
       batch_size=batch_size,
       num_infeed_hosts=num_infeed_hosts,
       input_random_seed=seed)
@@ -1460,9 +1762,13 @@ def get_eval_hparams_for_seqio(
     # tasks with varying splits.
     hp.split_name = _select_split(task.name, split_name)
     assert isinstance(hp.split_name, str)
-    if task.predict_metric_fns and metric_type is MetricType.PREDICT:
-      hparams.append(hp)
-    if task.score_metric_fns and metric_type is MetricType.SCORE:
-      hparams.append(hp)
-
+    if require_metric_fns:
+      if task.predict_metric_fns and metric_type is MetricType.PREDICT:
+        hparams.append(hp)
+      if task.score_metric_fns and metric_type is MetricType.SCORE:
+        hparams.append(hp)
+    else:
+      if not task.score_metric_fns and not task.predict_metric_fns:
+        # Show PPLX
+        hparams.append(hp)
   return hparams

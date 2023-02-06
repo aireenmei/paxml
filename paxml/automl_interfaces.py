@@ -57,6 +57,21 @@ class BaseReward(BaseParameterizable, metaclass=abc.ABCMeta):
   def used_metrics(self) -> Sequence['Metric']:
     """Returns `automl.Metric` objects used for computing current reward."""
 
+  @property
+  def needs_train(self) -> bool:
+    """Returns True if current reward needs training metrics."""
+    return any(m.is_train_metric for m in self.used_metrics)
+
+  @property
+  def needs_eval(self) -> bool:
+    """Returns True if current reward needs eval metrics."""
+    return any(m.is_eval_metric for m in self.used_metrics)
+
+  @property
+  def needs_decode(self) -> bool:
+    """Returns True if current reward needs decoding metrics."""
+    return any(m.is_decode_metric for m in self.used_metrics)
+
 
 class CrossStepMetricAggregator(BaseParameterizable, metaclass=abc.ABCMeta):
   """Aggregator for gathering metrics across multiple steps."""
@@ -102,6 +117,15 @@ class SearchHParams(BaseHyperParams):
       `[RuntimeError, (Exception, 'XLACompilation.*')]`, the trails that
       RuntimeError or errors that match 'XLACompilation.*' will be treated as
       to skip.
+    prior_study_ids: An optional list of Vizier study GUIDs to warm up current
+      search. All completed trials from previous studies will be feedback to
+      the controller via the `pg.DNAGenerator.recover` interface.
+    add_prior_trials: If True, trials from previous studies will be copied to
+      current study. Effective only when `prior_study_ids` is set.
+    add_experiment_config_to_metadata: If True (default), serialized experiment
+      config will be added to trial metadata for helping meta-learning later.
+      If the study will be very large and users don't want to store the
+      experiment config, set it to False.
   """
   search_algorithm: Optional[BaseAlgorithm.HParams] = None
   search_reward: Optional[BaseReward.HParams] = None
@@ -111,6 +135,9 @@ class SearchHParams(BaseHyperParams):
   max_num_trials: int = 1000000
   errors_to_skip: Optional[List[
       Union[Type[Exception], Tuple[Type[Exception], str]]]] = None
+  prior_study_ids: Optional[List[int]] = None
+  add_prior_trials: bool = False
+  add_experiment_config_to_metadata: bool = True
 
 
 class MetricType(enum.Enum):
@@ -226,6 +253,29 @@ class Metric:
     else:
       suffix = f':{self.sub_experiment_id}'
     return f'^{prefix}{self.metric_name}{suffix}$'
+
+  @property
+  def is_train_metric(self) -> bool:
+    """Returns True if current metric is train metric."""
+    p = self.pattern
+    return p.startswith(('^train', '^num_params'))
+
+  @property
+  def is_eval_train_metric(self) -> bool:
+    """Returns True if current metric is eval train metric."""
+    return self.pattern.startswith('^eval_train')
+
+  @property
+  def is_eval_metric(self) -> bool:
+    """Returns True if current metric is eval metric."""
+    p = self.pattern
+    return p.startswith(('^eval_test', '^eval_steps'))
+
+  @property
+  def is_decode_metric(self) -> bool:
+    """Returns True if current metric is decode metric."""
+    p = self.pattern
+    return p.startswith(('^decode_test', '^decode_steps'))
 
   @property
   def applies_to_multiple_datasets(self):

@@ -35,7 +35,7 @@ class SyntheticDataset(base_experiment.BaseExperiment):
 
   def _dataset_common(self, is_training) -> base_input.BaseInput.HParams:
     num_local_devices = jax.local_device_count()
-    batch_size = self.PERCORE_BATCH_SIZE * num_local_devices
+    batch_size = round(self.PERCORE_BATCH_SIZE * num_local_devices)
     input_p = input_generator.SyntheticLmData.HParams()
     if is_training:
       input_p.batch_size = batch_size
@@ -97,6 +97,12 @@ class LmCloudTransformerAdam(model_params.TransformerLmPmapAdam,
   DROPOUT_PROB = 0.0
   LEARNING_RATE = 1e-3
 
+  def task(self) -> tasks_lib.SingleTask.HParams:
+    """Returns the task parameters."""
+    task_p = super().task()
+    task_p.train.learner.repeat_prefix_sep = '_'
+    return task_p
+
 
 @experiment_registry.register
 class LmCloudTransformerAdamTest(LmCloudTransformerAdam):
@@ -134,6 +140,7 @@ class LmCloudSpmd(model_params.TransformerLmSpmdAdafactor, SyntheticDataset):
     """Returns the task parameters."""
     task_p = super().task()
     model_params.set_default_adam(task_p, self.LEARNING_RATE, self.WEIGHT_DECAY)
+    task_p.train.learner.repeat_prefix_sep = '_'
     return task_p
 
 
@@ -319,6 +326,31 @@ class LmCloudSpmdPipeline9B(LmCloudSpmdPipeline):
   CHECKPOINT_POLICY = layers.AutodiffCheckpointType.SAVE_NOTHING
   # 16-way pipeline and 4-way data parallelism.
   ICI_MESH_SHAPE = [16, 4, 1, 1]
+
+
+@experiment_registry.register
+class LmCloudSpmdPipeline175B(LmCloudSpmdPipeline):
+  """SPMD-pipelined model with 175B params.
+
+  Global batch size = 96
+  This config works on 8 hosts * 16 A100s.
+  """
+  MICROBATCH_SIZE = 2
+  PERCORE_BATCH_SIZE = 0.75
+
+  NUM_STAGES = 8
+  NUM_LAYERS = 96
+  MODEL_DIMS = 12288
+  NUM_HEADS = 96
+  DIMS_PER_HEAD = 128
+  MAX_SEQ_LEN = 2048
+  HIDDEN_DIMS = MODEL_DIMS * 4
+  FPROP_DTYPE = jnp.bfloat16
+
+  CHECKPOINT_POLICY = layers.AutodiffCheckpointType.SAVE_NOTHING
+  # 8-way pipeline and 16-way model parallelism.
+  ICI_MESH_SHAPE = [1, 1, 1, 16]
+  DCN_MESH_SHAPE = [8, 1, 1, 1]
 
 
 @experiment_registry.register

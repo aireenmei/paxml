@@ -27,7 +27,7 @@ import random
 import re
 import time
 import typing
-from typing import Dict, Optional, Sequence
+from typing import Optional, Sequence
 
 from absl import app
 from absl import flags
@@ -92,9 +92,6 @@ flags.DEFINE_bool(
     'Enables fully asynchronous checkpointing via GDA and TensorStore. This '
     'means that the training can continue ahead when checkpointing is '
     'happening.')
-flags.DEFINE_bool(
-    'jax_array_in_pax', True,
-    'Use jax.Array globally in PAX which replaces DA, SDA and GDA.')
 flags.DEFINE_string(
     'jax_traceback_filtering_option', 'auto',
     'Controls how JAX filters internal frames out of tracebacks: '
@@ -192,31 +189,6 @@ def wait_with_random_jitter(min_secs: int, max_secs: int) -> None:
   time.sleep(random.randint(min_secs, max_secs))
 
 
-def _default_early_stopping_fn(metrics: Dict[str, float],
-                               running_mode: trainer_lib.RunningMode,
-                               step_i: int, unused_arg: bool) -> bool:
-  """Dumping metrics into JSON file for debugging and other consumptions."""
-  if jax.process_index() == 0:
-    metric_dir = FLAGS.job_log_dir / 'metrics'
-    metric_dir.mkdir(parents=True, exist_ok=True)
-    if not metric_dir.is_dir():
-      raise ValueError(f'{metric_dir} should be a directory.')
-    metric_file_name = metric_dir / f'step-{step_i:06d}.json'
-
-    # Update and re-save the metrics.
-    if (running_mode & trainer_lib.RunningMode.EVAL or
-        running_mode & trainer_lib.RunningMode.DECODE):
-      if metric_file_name.exists():
-        # NOTE(daiyip): converting pg.Dict to dict which allows updates
-        # with dot ('.') separated keys. (dot can be a part of dataset name)
-        existing_metrics = dict(pg.load(str(metric_file_name)))
-      else:
-        existing_metrics = {}
-      metrics.update(existing_metrics)
-      pg.save(metrics, str(metric_file_name))
-  return False
-
-
 def run_experiment(
     experiment_config: base_experiment.BaseExperiment,
     work_unit: platform.WorkUnit,
@@ -252,7 +224,7 @@ def run_experiment(
         async_checkpointer = AsyncPersistenceCheckpointer(timeout_secs=600)
       else:
         async_checkpointer = checkpoints.AsyncCheckpointer(
-            checkpoints.PaxCheckpointHandler(enable_aggregation=False),
+            checkpoints.PaxCheckpointHandler(),
             timeout_secs=600)
 
     train.train_and_evaluate(
@@ -361,7 +333,7 @@ def run(experiment_config: base_experiment.BaseExperiment,
   search_space = tuning_lib.get_search_space(experiment_config)
   if search_space.dna_spec.is_constant:
     # TODO(b/241666951): disable default_early_stopping_fn since this
-    # breaks when training LaMDA models.
+    # breaks when training internal models.
     run_experiment(
         experiment_config,
         work_unit,
@@ -382,7 +354,8 @@ def run(experiment_config: base_experiment.BaseExperiment,
         is_metric_reporting_role=(FLAGS.metrics_from == FLAGS.mode),
         tuner_group=FLAGS.tuner_group,
         max_num_trials=FLAGS.num_trials,
-        controller_mode=FLAGS.controller_mode)
+        controller_mode=FLAGS.controller_mode,
+        running_mode=FLAGS.mode)
 
 
 def main(argv: Sequence[str]) -> None:
@@ -391,7 +364,6 @@ def main(argv: Sequence[str]) -> None:
 
   setup_jax.setup_jax(FLAGS.globally_use_hardware_rng, FLAGS.jax_backend_target,
                       FLAGS.jax_xla_backend, FLAGS.jax_enable_checks,
-                      FLAGS.jax_array_in_pax,
                       FLAGS.jax_traceback_filtering_option,
                       FLAGS.jax_fully_async_checkpoint)
 
@@ -417,7 +389,14 @@ if __name__ == '__main__':
     if int(task_id) == 0:
       dump_dir = os.getenv('XLA_DUMP_TO')
       if dump_dir:
-        os.environ['XLA_FLAGS'] = f'--xla_dump_to={dump_dir}'
+        existing_xla_flags = os.getenv('XLA_FLAGS')
+        to_append = f'--xla_dump_to={dump_dir}'
+        if existing_xla_flags:
+          os.environ['XLA_FLAGS'] = f'{existing_xla_flags} {to_append}'
+        else:
+          os.environ['XLA_FLAGS'] = to_append
+  # Log XLA_FLAGS for easy debugging.
+  logging.info("os.environ['XLA_FLAGS']=%s", os.getenv('XLA_FLAGS'))
 
   # Provide access to --jax_backend_target and --jax_xla_backend flags.
   jax.config.config_with_absl()

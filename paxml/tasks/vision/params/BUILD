@@ -17,6 +17,7 @@
 #   Vision modeling model configurations.
 
 load("//paxml:paxml.bzl", "pytype_library")
+# Import for Google-internal testing code.
 load("//paxml:build_defs.bzl", "pax_targets")
 load("//praxis:build-visibility.bzl", "JAX_VISIBILITY")
 
@@ -31,14 +32,19 @@ pytype_library(
     ],
     srcs_version = "PY3",
     deps = [
+        # Implicit absl.flags dependency.
         # Implicit jax dependency.
         "//paxml:base_experiment",
         "//paxml:experiment_registry",
-        "//paxml/tasks/lm:model_params",
+        "//paxml:learners",
+        "//paxml:tasks_lib",
         "//paxml/tasks/vision:input_generator",
         "//praxis:base_input",
         "//praxis:base_layer",
         "//praxis:optimizers",
+        "//praxis:pax_fiddle",
+        "//praxis:py_utils",
+        "//praxis:pytypes",
         "//praxis:schedules",
         "//praxis/layers",
     ],
@@ -49,3 +55,5 @@ pax_targets(
         ":params",
     ],
 )
+
+# Google-internal testing code.

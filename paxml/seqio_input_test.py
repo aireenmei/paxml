@@ -27,7 +27,6 @@ from praxis import py_utils
 from praxis import test_utils as flax_test_utils
 import seqio
 import tensorflow.compat.v2 as tf
-
 instantiate = base_hyperparams.instantiate
 NestedMap = py_utils.NestedMap
 
@@ -326,7 +325,8 @@ class InputTest(flax_test_utils.TestCase, seqio.test_utils.FakeTaskTest):
     p.task_feature_lengths = {'targets': 12}
     p.feature_converter = seqio_input.LanguageModelFeatures(pack=True)
     p.batch_size = 1
-    p.is_training = False
+    p.shuffle = False
+    p.is_training = True
     inp = instantiate(p)
     batch = inp.get_next()
     self.assertArraysEqual(
@@ -383,7 +383,8 @@ class InputTest(flax_test_utils.TestCase, seqio.test_utils.FakeTaskTest):
     p.task_feature_lengths = {'inputs': 6, 'targets': 3}
     p.feature_converter = seqio_input.SequenceModelFeatures(pack=False)
     p.batch_size = 2
-    p.is_training = False
+    p.shuffle = False
+    p.is_training = True
     inp = instantiate(p)
     batch = inp.get_next()
     self.assertSameElements(batch.src.keys(),
@@ -465,7 +466,8 @@ class InputTest(flax_test_utils.TestCase, seqio.test_utils.FakeTaskTest):
     p.feature_converter = seqio_input.SequenceModelFeaturesWithTaskInfo(
         pack=False)
     p.batch_size = 2
-    p.is_training = False
+    p.shuffle = False
+    p.is_training = True
     inp = instantiate(p)
     batch = inp.get_next()
     self.assertSameElements(
@@ -568,12 +570,42 @@ class InputTest(flax_test_utils.TestCase, seqio.test_utils.FakeTaskTest):
     p.eval_metrics_targets_length = 3
     p.reset_for_eval = True
     inp = instantiate(p)
-    vocab = inp._mixture_or_task.output_features['inputs'].vocabulary
+    vocab = inp.mixture_or_task.output_features['inputs'].vocabulary
     vocab.decode = mock.Mock(return_value='blahhh')
     m = inp.compute_metrics(decoder_outputs)
     self.assertLen(m, 1)
     self.assertEqual(m[0]['accuracy'], ['ex target', 'whatever'])
     vocab.decode.assert_called_once_with([7, 8, 1])
+
+  def test_compute_metrics_eval_num_batches(self):
+    task_name = 'compute_metrics_eval_num_batches'
+    ds = tf.data.Dataset.from_tensors({
+        'inputs': [7, 8],
+        'targets': [3, 9],
+        'targets_pretokenized': 'ex target',
+    }).repeat(6)
+    dataset_fn = lambda split, shuffle_files, seed=None: ds
+    _register_dummy_task(task_name, dataset_fn)
+    decoder_outputs = [('blahh', {'decoded_substr': 'whatever'})]
+    p = seqio_input.SeqIOInput.HParams()
+    p.mixture_name = task_name
+    p.split_name = 'validation'
+    p.task_feature_lengths = {'inputs': 4, 'targets': 1}
+    p.feature_converter = seqio_input.SequenceModelFeatures(pack=False)
+    p.batch_size = 1
+    p.is_training = False
+    p.eval_metrics_targets_length = 3
+    p.reset_for_eval = False
+    p.use_enumeration = False
+    p.eval_loop_num_batches = 2
+    inp = instantiate(p)
+    vocab = inp.mixture_or_task.output_features['inputs'].vocabulary
+    vocab.decode = mock.Mock(return_value='blahhh')
+    m = inp.compute_metrics(decoder_outputs)
+    metric_output = m[0]['accuracy']
+    self.assertLen(metric_output, 4)
+    self.assertEqual(metric_output,
+                     ['ex target', 'ex target', 'whatever', 'whatever'])
 
   def test_compute_metrics_eval(self):
     task_name = 'compute_metrics_eval'
@@ -687,7 +719,7 @@ class InputTest(flax_test_utils.TestCase, seqio.test_utils.FakeTaskTest):
         'score_task',
     ])
 
-  def test_eval_loop_num_batches_fails(self):
+  def test_repeat_on_full_eval_fails(self):
     self._setup_seqio_test_registry()
     p = seqio_input.SeqIOInput.HParams(
         mixture_name='pred_and_score_task',
@@ -700,17 +732,16 @@ class InputTest(flax_test_utils.TestCase, seqio.test_utils.FakeTaskTest):
         feature_converter=seqio_input.LanguageModelFeatures(
             pack=False, weights_on_targets_only=True),
         batch_size=4,
-        reset_for_eval=False,
-        eval_loop_num_batches=5,
+        reset_for_eval=True,
+        eval_loop_num_batches=None,
+        eval_auto_pad=False,
+        repeat=True,
     )
 
-    inp = instantiate(p)
-    err_msg_rgx = 'eval_loop_num_batches is not supported for eval SeqIOInput*'
+    err_msg_rgx = (
+        'Dataset has eval_loop_num_batches set to None while repeat is True.')
     with self.assertRaisesRegex(ValueError, err_msg_rgx):
-      _ = inp.compute_metrics_eval([])
-
-    with self.assertRaisesRegex(ValueError, err_msg_rgx):
-      _ = inp.compute_metrics([])
+      _ = instantiate(p)
 
   @parameterized.named_parameters(
       ('_no_padding', False, 1),

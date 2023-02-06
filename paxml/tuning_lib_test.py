@@ -60,11 +60,21 @@ class StopWithLowerMetric(automl.BaseReward):
     return [self._hparams.metric]
 
 
+class MockTask(pg.Dict):
+
+  def to_text(self) -> str:
+    return 'MOCK_TASK_CONFIG'
+
+
 class MockDataset(base_hyperparams.BaseParameterizable):
 
   class HParams(base_hyperparams.BaseParameterizable.HParams):
     dataset_param1: Optional[str] = None
     dataset_param2: Optional[Callable[[], int]] = None
+    is_training: bool = False
+
+    def to_text(self) -> str:
+      return 'MOCK_DATASET_CONFIG'
 
   def __init__(self, hparams):
     super().__init__(hparams)
@@ -82,17 +92,26 @@ class TuningExperiment(base_experiment.BaseExperiment):
   DECODER_DATASET_PARAM1 = pg.oneof(['x', 'y', 'z'])
 
   def task(self):
-    return {
-        'learning_rate': self.LEARNING_RATE,
-        'batch_size': pg.oneof([16, 32, 64], name='batch_size')
-    }
+    return MockTask(
+        learning_rate=self.LEARNING_RATE,
+        batch_size=pg.oneof([16, 32, 64], name='batch_size'),
+        train=pg.Dict(
+            eval_interval_steps=100,
+            decode_interval_steps=100))
 
   def datasets(self):
+    # NOTE(daiyip): `dataset_param2` shall appear in the search
+    # space: though its evaluation is delayed until instantiation,
+    # datasets will be instantiated during search space inspection.
     return [MockDataset.HParams(
         dataset_param1=self.DATASET_PARAM1,
-        dataset_param2=lambda: pg.oneof(range(3), name='dataset_param2'))]
+        dataset_param2=lambda: pg.oneof(range(3), name='dataset_param2'),
+        is_training=True)]
 
   def decoder_datasets(self):
+    # NOTE(daiyip): `decoder_dataset_param2` shall NOT appear in the search
+    # space: its evaluation is delayed until instantiation, and decoder
+    # datasets are not instantiated during search space inspection.
     return [MockDataset.HParams(
         dataset_param1=self.DECODER_DATASET_PARAM1,
         dataset_param2=(
@@ -107,6 +126,24 @@ class TuningExperiment(base_experiment.BaseExperiment):
         max_num_trials=10)
 
 
+class TuningWithTrainMetricsOnly(TuningExperiment):
+  """Tuning experiment based on train metrics only."""
+
+  def search(self):
+    search_p = super().search()
+    search_p.search_reward.metric = automl.Metric.train_steps_per_second()
+    return search_p
+
+
+class TuningWithDecodeMetricsOnly(TuningExperiment):
+  """Tuning experiment based on train metrics only."""
+
+  def search(self):
+    search_p = super().search()
+    search_p.search_reward.metric = automl.Metric.decode('f1')
+    return search_p
+
+
 @automl.parameter_sweep()
 class ParameterSweepingWithCartesianProduct(base_experiment.BaseExperiment):
   """Parameter sweep the search space."""
@@ -115,10 +152,9 @@ class ParameterSweepingWithCartesianProduct(base_experiment.BaseExperiment):
   DATASET_PARAM1 = pg.oneof(['foo', 'bar'])
 
   def task(self):
-    return {
-        'learning_rate': self.LEARNING_RATE,
-        'batch_size': pg.oneof([16, 32, 64], name='batch_size')
-    }
+    return MockTask(
+        learning_rate=self.LEARNING_RATE,
+        batch_size=pg.oneof([16, 32, 64], name='batch_size'))
 
   def datasets(self):
     return [MockDataset.HParams(dataset_param1=self.DATASET_PARAM1)]
@@ -139,24 +175,22 @@ class ParameterSweepingWithCustomCombinations(
   BATCH_SIZE = pg.oneof([16, 32, 64])
 
   def task(self):
-    return {
-        'learning_rate': self.LEARNING_RATE,
+    return MockTask(
+        learning_rate=self.LEARNING_RATE,
         # Sparse parameter sweep does not support decision points defined
         # within function body, thus we make it a class attribute.
-        'batch_size': self.BATCH_SIZE
-    }
+        batch_size=self.BATCH_SIZE)
 
 
 class TuningWithBadSearchSpace(TuningExperiment):
   """A bad search space which has `oneof` on-the-fly without name."""
 
   def task(self):
-    return {
-        'learning_rate': self.LEARNING_RATE,
+    return MockTask(
+        learning_rate=self.LEARNING_RATE,
         # Bad decision point: a `pg.oneof` created on the fly without
         # specifying a name.
-        'batch_size': pg.oneof([16, 32, 64])
-    }
+        batch_size=pg.oneof([16, 32, 64]))
 
 
 class TuningWithPerTrialEarlyStopping(TuningExperiment):
@@ -278,6 +312,28 @@ def run_experiment(experiment_config: base_experiment.BaseExperiment,
     return
 
 
+def run_experiment_with_train_metrics_only(
+    experiment_config: base_experiment.BaseExperiment,
+    work_unit: platform.WorkUnit, job_log_dir: epath.Path,
+    early_stopping_fn: trainer_lib.EarlyStoppingFn):
+  del work_unit, job_log_dir
+  _ = experiment_config.task()
+  _ = experiment_config.datasets()
+  _ = experiment_config.decoder_datasets()
+
+  _ = tuning_lib.should_early_stop(
+      early_stopping_fn,
+      global_step=10,
+      train_steps_per_sec=2.5,
+      is_last_ckpt=False)
+
+  _ = tuning_lib.should_early_stop(
+      early_stopping_fn,
+      global_step=20,
+      train_steps_per_sec=3.0,
+      is_last_ckpt=True)
+
+
 def run_experiment_without_reporting_metrics(
     experiment_config: base_experiment.BaseExperiment,
     work_unit: platform.WorkUnit, job_log_dir: epath.Path,
@@ -306,10 +362,8 @@ class GetSearchSpaceTest(absltest.TestCase):
         'dataset_param2': pg.oneof(range(3), name='dataset_param2'),
         'DECODER_DATASET_PARAM1': pg.oneof(['x', 'y', 'z'],
                                            name='DECODER_DATASET_PARAM1'),
-        'decoder_dataset_param2': pg.oneof(range(3),
-                                           name='decoder_dataset_param2')
     }))
-    self.assertEqual(search_space.dna_spec.space_size, 3 * 3 * 2 * 3 * 3 * 3)
+    self.assertEqual(search_space.dna_spec.space_size, 3 * 3 * 2 * 3 * 3)
 
   def test_parameter_sweep_space_with_cartesian_product(self):
     search_space = tuning_lib.get_search_space(
@@ -366,7 +420,7 @@ class TuneTest(absltest.TestCase):
                      [True, False, False, False, False])
     # We use the average of the metrics across steps as the final measurement.
     self.assertEqual([t.final_measurement.reward for t in result.trials],
-                     [0.0, 0.32 * 2, 3.2 * 2, 0.32 * 2, 1.6 * 2])
+                     [0.0, 0.32 * 2, 1.6 * 2, 0.64 * 2, 0.64 * 2])
     # Make sure unused metric does not appear in reported metrics.
     self.assertEqual(result.trials[1].final_measurement.metrics, {
         'eval_test_abc/metrics/reward': 0.64,
@@ -374,6 +428,19 @@ class TuneTest(absltest.TestCase):
     # We added an extra measurement for the final report, with final step + 1.
     self.assertEqual([t.final_measurement.step for t in result.trials],
                      [0, 21, 21, 21, 21])
+    # Make sure experiment config is saved as trial metadata.
+    self.assertEqual(
+        result.trials[0].metadata.get('experiment_config'),
+        {
+            'format_version': 1.0,
+            'source': 'pax',
+            'config': {
+                '': pg.Dict(
+                    datasets=['MOCK_DATASET_CONFIG'],
+                    decoder_datasets=['MOCK_DATASET_CONFIG'],
+                    task='MOCK_TASK_CONFIG')
+            }
+        })
 
   def test_parameter_sweep_with_catesian_product(self):
     search_space = tuning_lib.get_search_space(
@@ -395,6 +462,24 @@ class TuneTest(absltest.TestCase):
                     study='local_hp_sweep_custom')
     result = pg.tuning.poll_result('local_hp_sweep_custom')
     self.assertLen(result.trials, search_space.dna_spec.space_size)
+
+  def test_tune_with_train_metrics_only(self):
+    job_log_dir = epath.Path(absltest.get_default_test_tmpdir())
+    tuning_lib.tune(run_experiment_with_train_metrics_only,
+                    TuningWithTrainMetricsOnly(),
+                    platform.work_unit(),
+                    job_log_dir,
+                    study='local_train_metrics_only',
+                    max_num_trials=2)
+    result = pg.tuning.poll_result('local_train_metrics_only')
+    self.assertLen(result.trials, 2)
+    self.assertEqual([t.status for t in result.trials], ['COMPLETED'] * 2)
+    self.assertEqual([t.infeasible for t in result.trials], [False] * 2)
+    # There will be two measurements, one reported at the last step, and
+    # one aggregated by cross-step metric aggregator.
+    self.assertEqual([len(t.measurements) for t in result.trials], [2] * 2)
+    self.assertEqual([t.final_measurement.reward for t in result.trials],
+                     [3.0] * 2)
 
   def test_tune_without_reporting_metrics(self):
     job_log_dir = epath.Path(absltest.get_default_test_tmpdir())
@@ -422,11 +507,11 @@ class TuneTest(absltest.TestCase):
     reward_at_step0 = (
         lambda t: t.measurements[0].reward if t.measurements else None)
     self.assertEqual([reward_at_step0(t) for t in result.trials],
-                     [None, None, 3.2, None, 1.6])
+                     [None, None, 1.6, None, None])
     self.assertEqual([len(t.measurements) for t in result.trials],
-                     [0, 0, 3, 0, 3])
+                     [0, 0, 3, 0, 0])
     self.assertEqual([t.infeasible for t in result.trials],
-                     [True, True, False, True, False])
+                     [True, True, False, True, True])
 
   def test_tune_with_per_trial_early_stopping_and_reward_replacement(self):
     job_log_dir = epath.Path(absltest.get_default_test_tmpdir())
@@ -443,9 +528,9 @@ class TuneTest(absltest.TestCase):
     reward_at_step0 = (
         lambda t: t.measurements[0].reward if t.measurements else None)
     self.assertEqual([reward_at_step0(t) for t in result.trials],
-                     [None, -1.0, 3.2, -1.0, 1.6])
+                     [None, -1.0, 1.6, -1.0, -1.0])
     self.assertEqual([len(t.measurements) for t in result.trials],
-                     [0, 1, 3, 1, 3])
+                     [0, 1, 3, 1, 1])
     self.assertEqual([t.infeasible for t in result.trials],
                      [True, False, False, False, False])
 
@@ -464,11 +549,11 @@ class TuneTest(absltest.TestCase):
     reward_at_step0 = (
         lambda t: t.measurements[0].reward if t.measurements else None)
     self.assertEqual([reward_at_step0(t) for t in result.trials],
-                     [None, 100., 3.2, 100., 1.6])
+                     [None, 100., 1.6, 100., 100.0])
     self.assertEqual([t.final_measurement.reward for t in result.trials],
-                     [0., 100., 6.4, 100., 3.2])
+                     [0., 100., 3.2, 100., 100.0])
     self.assertEqual([len(t.measurements) for t in result.trials],
-                     [0, 1, 3, 1, 3])
+                     [0, 1, 3, 1, 1])
     self.assertEqual([t.infeasible for t in result.trials],
                      [True, False, False, False, False])
 
@@ -486,14 +571,14 @@ class TuneTest(absltest.TestCase):
     reward_at_step0 = (
         lambda t: t.measurements[0].reward if t.measurements else None)
     self.assertEqual([reward_at_step0(t) for t in result.trials],
-                     [None, 0.32, 3.2, 0.32, 1.6])
+                     [None, 0.32, 1.6, 0.64, 0.64])
     self.assertEqual([len(t.measurements) for t in result.trials],
-                     [0, 1, 3, 1, 3])
+                     [0, 1, 3, 1, 1])
     self.assertEqual([t.infeasible for t in result.trials],
-                     [True, True, False, True, False])
+                     [True, True, False, True, True])
     # We use the average of the metrics across steps as the final measurement.
     self.assertEqual([t.final_measurement.reward for t in result.trials],
-                     [0.0, 0.0, 3.2 * 2, 0.0, 1.6 * 2])
+                     [0.0, 0.0, 1.6 * 2, 0.0, 0.0])
 
   def test_tune_with_subexperiments(self):
     job_log_dir = epath.Path(absltest.get_default_test_tmpdir())
@@ -506,14 +591,8 @@ class TuneTest(absltest.TestCase):
     result = pg.tuning.poll_result('local_subexperiments')
     self.assertLen(result.trials, 5)
     self.assertEqual([t.infeasible for t in result.trials],
-                     [True, False, True, False, True])
+                     [True, False, True, True, True])
     self.assertEqual(result.trials[1].final_measurement.metrics, {
-        'eval_test_abc/metrics/reward:1x': 0.64,
-        'eval_test_abc/metrics/reward:2x': 1.28,
-        'eval_test_abc/metrics/reward:4x': 2.56,
-        'eval_test_abc/metrics/reward:8x': 5.12
-    })
-    self.assertEqual(result.trials[3].final_measurement.metrics, {
         'eval_test_abc/metrics/reward:1x': 0.64,
         'eval_test_abc/metrics/reward:2x': 1.28,
         'eval_test_abc/metrics/reward:4x': 2.56,
@@ -522,8 +601,29 @@ class TuneTest(absltest.TestCase):
     # We use the average of the metrics across steps as the final measurement.
     self.assertEqual([t.final_measurement.reward for t in result.trials],
                      # Used aggregator='max' for computing the reward.
-                     [0.0, 0.64 + 1.28 + 2.56 + 5.12,
-                      0.0, 0.64 + 1.28 + 2.56 + 5.12, 0.0])
+                     [0.0, 0.64 + 1.28 + 2.56 + 5.12, 0.0, 0.0, 0.0])
+
+  def test_bad_running_mode(self):
+    job_log_dir = epath.Path(absltest.get_default_test_tmpdir())
+    with self.assertRaisesRegex(
+        ValueError,
+        'Tuning uses training metrics but the reporting role is \'eval\''):
+      tuning_lib.tune(run_experiment,
+                      TuningWithTrainMetricsOnly(),
+                      platform.work_unit(),
+                      job_log_dir,
+                      study='local_bad_running_mode1',
+                      running_mode='eval')
+
+    with self.assertRaisesRegex(
+        ValueError,
+        'Tuning uses decode metrics but the reporting role is \'eval\''):
+      tuning_lib.tune(run_experiment,
+                      TuningWithDecodeMetricsOnly(),
+                      platform.work_unit(),
+                      job_log_dir,
+                      study='local_bad_running_mode2',
+                      running_mode='eval')
 
   def test_is_last_checkpoint(self):
     # Training step has reached.
@@ -638,7 +738,7 @@ class TrialDirnameTest(absltest.TestCase):
               pg.oneof([A([A(A(1)), 1]), A([A(2)])], name='y'))
     self.assertEqual(
         str(get_trial_dirname(_fn, 1, pg.DNA([1, 0]))),
-        'root/1/x=e_f1234|y=A(x=[0=A(x=A(x=1)),1=1])')
+        'root/1/x=e_f1234|y=A(x={0=A(x=A(x=1)),1=1})')
 
   def test_trial_with_class_values(self):
     class Foo:

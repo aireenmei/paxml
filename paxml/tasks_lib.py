@@ -20,7 +20,6 @@ the `tasks` Python submodule.
 """
 
 from __future__ import annotations
-
 import dataclasses
 import enum
 import itertools
@@ -34,24 +33,23 @@ import flax
 import jax
 from jax import numpy as jnp
 from jax.experimental import global_device_array
-from jax.experimental import maps
-from jax.experimental import pjit
 import numpy as np
 import optax
 from paxml import base_inference_runner
 from paxml import base_metrics
 from paxml import base_task
 from paxml import io_utils
+from paxml import learners as learners_lib
+from paxml import train_states
 from praxis import asserts
 from praxis import base_hyperparams
 from praxis import base_input
 from praxis import base_layer
 from praxis import base_model
-from praxis import learners as learners_lib
 from praxis import optimizers
+from praxis import pax_fiddle
 from praxis import py_utils
 from praxis import pytypes
-from praxis import train_states
 
 from paxml import checkpoints  # mapped to internal
 
@@ -61,7 +59,7 @@ Nested = pytypes.Nested
 NestedMap = py_utils.NestedMap
 NestedJTensor = base_layer.NestedJTensor
 JTensor = base_layer.JTensor
-PartitionSpec = pjit.PartitionSpec
+PartitionSpec = jax.sharding.PartitionSpec
 TrainState = train_states.TrainState
 
 PRNGKey = pytypes.PRNGKey
@@ -74,6 +72,19 @@ instantiate = base_hyperparams.instantiate
 # Shorthand for a loading rule that loads everything as is.
 # e.g. load_rules = [LOAD_ALL]
 LOAD_ALL = ('(.*)', '{}')
+
+TRAIN_DEFAULT_MUTABLE_LIST = [
+    base_layer.AUX_LOSS,
+    base_layer.SUMMARIES,
+    base_layer.NON_TRAINABLE,
+] + base_layer.NON_PAX_VAR_COLLECTION
+
+
+EVAL_DEFAULT_MUTABLE_LIST = [
+    base_layer.AUX_LOSS,
+    base_layer.SUMMARIES,
+    base_layer.NON_TRAINABLE,
+]
 
 
 def _flatten_dict(
@@ -222,7 +233,9 @@ def _assign_model_vars(model_vars: Union[NestedMap, Dict[str, Any]],
     elif isinstance(loaded_var, global_device_array.GlobalDeviceArray):
       loaded_var = py_utils.copy_gda(loaded_var)
     else:
-      loaded_var = jnp.copy(loaded_var)
+      # Allow the copy of cross-host Jax arrays.
+      with jax.spmd_mode('allow_all'):
+        loaded_var = jnp.copy(loaded_var)
     if isinstance(model_vars, NestedMap):
       model_vars.Set(var_name, loaded_var)
     else:
@@ -230,9 +243,12 @@ def _assign_model_vars(model_vars: Union[NestedMap, Dict[str, Any]],
 
 
 def _make_gda_train_state(
-    rules: CheckpointLoadingRules, ckpt_train_state: TrainState,
-    train_state_pspecs: TrainState, matched_pspecs: Dict[str, Any],
-    load_ema_state: bool) -> Tuple[TrainState, TrainState]:
+    rules: CheckpointLoadingRules,
+    ckpt_train_state: TrainState,
+    train_state_pspecs: TrainState,
+    matched_pspecs: Dict[str, Any],
+    load_ema_states: bool,
+) -> Tuple[TrainState, TrainState]:
   """Makes changes to checkpoint train states for GDA ckpts."""
   # For GDA checkpoint type, skip loading step / opt states from the
   # checkpoint if rules are set to False. FLAX checkpoint type doesn't support
@@ -241,8 +257,11 @@ def _make_gda_train_state(
     ckpt_train_state = ckpt_train_state.replace(step={})
     if train_state_pspecs is not None:
       train_state_pspecs = train_state_pspecs.replace(step={})
-  if (not rules.load_opt_states and not rules.partial_load_opt_states and
-      not load_ema_state):
+  if (
+      not rules.load_opt_states
+      and not rules.partial_load_opt_states
+      and not load_ema_states
+  ):
     ckpt_train_state = ckpt_train_state.replace(opt_states={})
     if train_state_pspecs is not None:
       train_state_pspecs = train_state_pspecs.replace(opt_states={})
@@ -264,7 +283,7 @@ def _make_gda_train_state(
   ckpt_train_state = ckpt_train_state.replace(mdl_vars=filtered_vars)
   if train_state_pspecs is not None:
     train_state_pspecs = train_state_pspecs.replace(mdl_vars=pspecs)
-  if load_ema_state:
+  if load_ema_states:
     new_states = []
     new_states_pspecs = []
     # TODO(pax-dev): This doesn't work with prefix dims.
@@ -372,15 +391,17 @@ def restore_pmap_from_tensorstore(
     ShardedDeviceArray`.
   """
   if global_mesh is None:
-    restore_global_mesh = maps.Mesh(np.array(jax.devices()), axis_names=('x',))
+    restore_global_mesh = jax.sharding.Mesh(
+        np.array(jax.devices()), axis_names=('x',)
+    )
   else:
     restore_global_mesh = global_mesh
 
   def _get_spec(shape):
     if shape.shape:
-      return pjit.PartitionSpec(None)
+      return jax.sharding.PartitionSpec(None)
     else:
-      return pjit.PartitionSpec()
+      return jax.sharding.PartitionSpec()
 
   fully_replicated_state_specs = jax.tree_map(_get_spec, global_shapes)
   with restore_global_mesh:
@@ -390,8 +411,7 @@ def restore_pmap_from_tensorstore(
         global_mesh=restore_global_mesh,
         checkpoint_type=checkpoint_type,
         state_specs=fully_replicated_state_specs,
-        step=step,
-        use_orbax=True)
+        step=step)
   if global_mesh is not None:
     return fully_replicated_gda_model_states
   if checkpoint_type == CheckpointType.CHECKPOINT_PERSISTENCE:
@@ -481,6 +501,7 @@ class CheckpointLoadingRules(NamedTuple):
     load_step: whether to load the step from this checkpoint.
     load_opt_states: whether to load opt_states (in its entirety) from this
       checkpoint.
+    load_ema_states: whether to load EMA state.
     partial_load_opt_states: whether to enable experimental partial opt_states
       loading from this checkpoint.
     input_specs_provider_p: A `BaseInputSpecsProvider.HParams` used to provide
@@ -493,9 +514,228 @@ class CheckpointLoadingRules(NamedTuple):
   step: Optional[int] = None
   load_step: bool = False
   load_opt_states: bool = False
+  load_ema_states: bool = True
   partial_load_opt_states: bool = False
   input_specs_provider_p: Optional[
       base_input.BaseInputSpecsProvider.HParams] = None
+
+
+def create_state_partition_specs(
+    var_weight_hparams: NestedJTensor,
+    mesh_shape: Sequence[int],
+    mesh_axis_names: List[str],
+    discard_opt_states: bool,
+    learners: Optional[Sequence[learners_lib.Learner]],
+):
+  """Creates partition specs for all variables used in training.
+
+  Args:
+    var_weight_hparams: a nested map of variable params for all the forward
+      variables.
+    mesh_shape: shape of the logical mesh.
+    mesh_axis_names: axis names of each mesh axis.
+    discard_opt_states: when true, optimizer slot variables are skipped.
+    learners: learners of the optimizer. Cannot be None if discard_opt_states
+      is false.
+
+  Returns:
+    A TrainState that contains PartitionSpecs.
+  """
+
+  step_partition_spec = PartitionSpec()
+  var_partition_specs = base_layer.var_partition_specs(
+      var_weight_hparams,
+      mesh_shape=mesh_shape,
+      device_axis_names=mesh_axis_names)
+  if discard_opt_states:
+    opt_var_partition_specs = {}
+  else:
+    grad_txs = [x.get_grad_tx(var_weight_hparams) for x in learners]
+    opt_var_weight_hparams = []
+    for grad_tx in grad_txs:
+      assert isinstance(grad_tx, optimizers.ShardedGradientTransformation)
+      opt_var_weight_hparams.append(
+          grad_tx.init_partition_spec(var_weight_hparams))
+    opt_var_partition_specs = base_layer.var_partition_specs(
+        opt_var_weight_hparams,
+        mesh_shape=mesh_shape,
+        device_axis_names=mesh_axis_names)
+
+    # Note that due to the double nesting of sharded chain we need to un-mask
+    # the outer MaskedState() if present. If this is only a single optimizer
+    # the tree_map() will go through with a no-op.
+    def _is_instance_masked_state(x):
+      return isinstance(x, optax.MaskedState)
+
+    def _maybe_unmask_outer_masked_state(x):
+      if _is_instance_masked_state(x):
+        return x.inner_state
+      return x
+
+    opt_var_partition_specs = jax.tree_map(
+        _maybe_unmask_outer_masked_state,
+        opt_var_partition_specs,
+        is_leaf=_is_instance_masked_state)
+  return TrainState(
+      step=step_partition_spec,
+      mdl_vars=var_partition_specs,
+      opt_states=opt_var_partition_specs)
+
+
+def _create_opt_states(
+    mdl_vars: NestedJTensor,
+    var_weight_hparams: NestedJTensor,
+    learners: Sequence[learners_lib.Learner],
+) -> List[NestedJTensor]:
+  """Creates opt_states by applying gradient transformations.
+
+  Args:
+    mdl_vars: A nested structure of model vars to in TrainState.
+    var_weight_hparams: WeightHParams for each of the variable in mdl_vars.
+      var_weight_hparams must be of the same structure as mdl_vars. Each model
+      weight variable is associated with some WeightHParams which contains all
+      the meta information about the weight variable.
+    learners: learners of the optimizer.
+
+  Returns:
+    A list of NestedJTensor to update `opt_states` in TrainState.
+  """
+  grad_txs = [x.get_grad_tx(var_weight_hparams) for x in learners]
+  asserts.assert_same_structure(mdl_vars, var_weight_hparams)
+  return [x.init(mdl_vars) for x in grad_txs]
+
+
+def create_state(
+    mdl_vars: NestedJTensor,
+    var_weight_hparams: NestedJTensor,
+    discard_opt_states: bool,
+    learners: Optional[Sequence[learners_lib.Learner]],
+) -> TrainState:
+  """Creates train states that holds all the forward/backward variables.
+
+  Args:
+    mdl_vars: A nested structure of model vars to create TrainState for.
+      'mdl_vars' can be a sub-set of self.vars.
+    var_weight_hparams: WeightHParams for each of the variable in mdl_vars.
+      var_weight_hparams must be of the same structure as mdl_vars. Each model
+      weight variable is associated with some WeightHParams which contains all
+      the meta information about the weight variable.
+    discard_opt_states: bool, When true, optimizer slot variables are skipped.
+    learners: learners of the optimizer. Cannot be None if discard_opt_states is
+      false.
+
+  Returns:
+    a TrainState.
+  """
+  # Make a private copy of mdl_vars and var_weight_hparams structures that are
+  # not shared with the caller.
+  mdl_vars = jax.tree_util.tree_map(lambda x: x, mdl_vars)
+  var_weight_hparams = jax.tree_util.tree_map(lambda x: x, var_weight_hparams)
+  if discard_opt_states:
+    opt_states = {}
+  else:
+    opt_states = _create_opt_states(mdl_vars, var_weight_hparams, learners)
+
+  return TrainState(
+      # The global step for the model.
+      step=jnp.array(0, dtype=jnp.uint32),
+      mdl_vars=mdl_vars,
+      opt_states=opt_states,
+  )
+
+
+def create_state_unpadded_shapes(
+    var_weight_hparams: NestedJTensor,
+    discard_opt_states: bool,
+    learners: Optional[Sequence[learners_lib.Learner]],
+) -> TrainState:
+  """Creates shapes for all variables used in training without padding...
+
+  due to uneven sharding.
+
+  Args:
+    var_weight_hparams: a nested map of variable params for all the forward
+      variables.
+    discard_opt_states: bool, When true, optimizer slot variables are skipped.
+    learners: learners of the optimizer. Cannot be None if discard_opt_states is
+      false.
+
+  Returns:
+    A TrainState contains jax.ShapeDtypeStruct for all the forward and
+      backward variables.
+  """
+
+  def _get_shape(var_param):
+    shape = tuple(var_param.repeat_prefix or ()) + tuple(var_param.shape)
+    return jax.ShapeDtypeStruct(shape, var_param.dtype)
+
+  var_shapes = jax.tree_map(_get_shape, var_weight_hparams)
+
+  def _create_train_state_from_shape(mdl_vars):
+    return create_state(
+        mdl_vars, var_weight_hparams, discard_opt_states, learners
+    )
+
+  return jax.eval_shape(_create_train_state_from_shape, var_shapes)
+
+
+def create_state_padded_shapes(
+    var_weight_hparams: NestedJTensor,
+    mesh_shape: Sequence[int],
+    mesh_axis_names: List[str],
+    discard_opt_states: bool,
+    learners: Optional[Sequence[learners_lib.Learner]],
+) -> TrainState:
+  """Creates shapes for all variables used in training with padding...
+
+  due to uneven sharding.
+
+  Args:
+    var_weight_hparams: a nested map of variable params for all the forward
+      variables.
+    mesh_shape: shape of the logical mesh.
+    mesh_axis_names: axis names of each mesh axis.
+    discard_opt_states: bool, When true, optimizer slot variables are skipped.
+    learners: learners of the optimizer. Cannot be None if discard_opt_states is
+      false.
+
+  Returns:
+    A TrainState contains jax.ShapeDtypeStruct for all the forward and
+      backward variables.
+  """
+  unpadded_shapes = create_state_unpadded_shapes(
+      var_weight_hparams, discard_opt_states, learners
+  )
+
+  if mesh_shape is None:
+    return unpadded_shapes
+
+  model_state_partition_specs = create_state_partition_specs(
+      var_weight_hparams,
+      mesh_shape,
+      mesh_axis_names,
+      discard_opt_states,
+      learners,
+  )
+  asserts.assert_same_structure(model_state_partition_specs, unpadded_shapes)
+
+  def _maybe_pad(shape_dtype, pspec):
+    if py_utils.is_optax_masked_node(shape_dtype):
+      return shape_dtype
+    unpadded_shape = shape_dtype.shape
+    paddings = py_utils.get_uneven_sharding_paddings(
+        pspec, unpadded_shape, mesh_shape, mesh_axis_names
+    )
+    padded_shape = [s + p for (s, p) in zip(unpadded_shape, paddings)]
+    return jax.ShapeDtypeStruct(padded_shape, shape_dtype.dtype)
+
+  padded_shapes = jax.tree_map(
+      _maybe_pad,
+      unpadded_shapes,
+      model_state_partition_specs,
+      is_leaf=py_utils.is_optax_masked_node,
+  )
+  return padded_shapes
 
 
 class SingleTask(base_task.BaseTask):
@@ -566,11 +806,14 @@ class SingleTask(base_task.BaseTask):
       eval_skip_train: By default, we also run eval on the training data input
         (`eval_train`), specifically on a batch not yet used for training. When
         set to True, this is skipped.
-      inputs_split_mapping: The PartitionSpec for inputssuch as inputs, labels,
-        targets, paddings, num words etc. This is onlyrelevant for SPMD sharded
-        models. By default it is None, which meansall the inputs are replicated.
-        For sharding inputs, this is a `NestedMap` with keys `map_1d`, `map_2d`,
-        ..., etc.,which specifies how to shard the inputs of that dimension.
+      eval_use_ema_states: If True, use ema states to run eval during train,
+        note that in this case ema MUST be enabled in the learner.
+      inputs_split_mapping: The PartitionSpec for inputs such as inputs, labels,
+        targets, paddings, num words etc. This is only relevant for SPMD sharded
+        models. By default it is None, which means all the inputs are
+        replicated. For sharding inputs, this is a `NestedMap` with keys
+        `map_1d`, `map_2d`, ..., etc., which specifies how to shard the inputs
+        of that dimension.
       init_from_checkpoint_rules: A dict with str-valued keys corresponding to
         checkpoint dir paths and values corresponding to instances of
         `CheckpointLoadingRules`. See doc string on CheckpointLoadingRules on
@@ -580,7 +823,7 @@ class SingleTask(base_task.BaseTask):
         this value is not a positive int. Set to 0 to disable decode steps.
       decode_start_after_n_steps: Starts decoder after N steps, only used in
         continuous decoding.
-      decode_use_ema_state: If True, use ema states to run decode during train,
+      decode_use_ema_states: If True, use ema states to run decode during train,
         note that in this case ema MUST be enabled in the learner.
       profiler_num_steps: The number of steps to be captured by the profiler
         based on the step time estimate.
@@ -594,6 +837,9 @@ class SingleTask(base_task.BaseTask):
       always_use_train_for_model_init: Boolean indicating whether to use the new
         flow for model initialization. With this new flow, dedicated evaluation
         and decoding-only jobs rely on training inputs for model initialization.
+      random_seed: Random seed to use at the beginning of the training.
+      apply_mutable_list: A list of allowed collections to be mutated during
+        train apply.
     """
     learner: learners_lib.Learner.HParams = sub_config_field(
         learners_lib.Learner.HParams)
@@ -608,18 +854,23 @@ class SingleTask(base_task.BaseTask):
     variable_norm_summary: bool = True
     eval_interval_steps: int = 100
     eval_skip_train: bool = False
+    eval_use_ema_states: bool = False
     inputs_split_mapping: Optional[PartitionSpec] = None
     init_from_checkpoint_rules: Dict[
         str, CheckpointLoadingRules] = dataclasses.field(default_factory=dict)
     decode_interval_steps: Optional[int] = None
     decode_start_after_n_steps: int = 0
     # TODO(zhishuai): verify this for a pjit model.
-    decode_use_ema_state: bool = False
+    decode_use_ema_states: bool = False
     profiler_num_steps: int = 2
     profiler_min_duration_sec: float = 1.
     profiler_capture_step: Optional[int] = None
     profiler_max_num_hosts: Optional[int] = None
     always_use_train_for_model_init: bool = True
+    random_seed: int = 1234
+    apply_mutable_list: List[str] = dataclasses.field(
+        default_factory=lambda: TRAIN_DEFAULT_MUTABLE_LIST
+    )
 
   class DecodeHParams(base_hyperparams.BaseHyperParams):
     """Parameters for decoding.
@@ -629,9 +880,34 @@ class SingleTask(base_task.BaseTask):
         decoding batch index. Only effective for pmap decoding.
       prng_key_fold_with_global_step: if True, folds the decode prng key with
         the checkpoint global step. Only effective for pmap decoding.
+      random_seed: Random seed to use at the beginning of the decoding.
     """
     prng_key_fold_with_batch_index: bool = False
     prng_key_fold_with_global_step: bool = True
+    random_seed: int = 1234
+
+  class EvaluateHParams(base_hyperparams.BaseHyperParams):
+    """Parameters for evaluation.
+
+    Attributes:
+      random_seed: Random seed to use at the beginning of the evaluation.
+      apply_mutable_list: A list of allowed collections to be mutated during
+        evaluation apply.
+    """
+
+    random_seed: int = 1234
+    apply_mutable_list: List[str] = dataclasses.field(
+        default_factory=lambda: EVAL_DEFAULT_MUTABLE_LIST
+    )
+
+  class InferHParams(base_hyperparams.BaseHyperParams):
+    """Parameters for inference.
+
+    Attributes:
+      random_seed: Random seed to use at the beginning of the inference.
+    """
+
+    random_seed: int = 1234
 
   @enum.unique
   class TrackDecoderMetricMode(str, enum.Enum):
@@ -656,10 +932,9 @@ class SingleTask(base_task.BaseTask):
       track_decoder_metric_min_or_max: track min or max metric value.
       infer_writer: specifies how to generate and write some output with a model
     """
-    # TODO(b/249483164) Change this to just `= sub_config_field(None)` after
-    # Fiddle migration is complete.
-    model: Optional[base_model.BaseModel.HParams] = (None if issubclass(
-        base_model.BaseModel, base_layer.BaseLayer) else sub_config_field(None))
+    model: Optional[pax_fiddle.Config[base_model.BaseModel]] = sub_config_field(
+        None
+    )
 
     # Implementation note: `SingleTask` is not defined in the interpreter
     # context here, so we need to wrap it in a lambda which will look it up from
@@ -668,6 +943,13 @@ class SingleTask(base_task.BaseTask):
         lazy_ref=lambda: SingleTask.TrainHParams)
     decode: SingleTask.DecodeHParams = sub_config_field(
         lazy_ref=lambda: SingleTask.DecodeHParams)
+    evaluate: SingleTask.EvaluateHParams = sub_config_field(
+        lazy_ref=lambda: SingleTask.EvaluateHParams
+    )
+    infer: SingleTask.InferHParams = sub_config_field(
+        lazy_ref=lambda: SingleTask.InferHParams
+    )
+
     metrics: Any = None
     loss_aggregator: Any = None
     vn: SingleTask.VariationalNoiseHParams = sub_config_field(
@@ -695,7 +977,7 @@ class SingleTask(base_task.BaseTask):
     self._learners = NestedMap(sub=learner_params).Transform(_instantiate).sub
 
     assert p.model is not None
-    self._model: base_model.BaseModel = instantiate(p.model)
+    self._model_inst: base_model.BaseModel = instantiate(p.model)
 
     # instantiate the metrics aggregation helper
     if p.metrics:
@@ -709,17 +991,18 @@ class SingleTask(base_task.BaseTask):
       if any([learner.loss_name is not None for learner in self._learners]):
         raise ValueError('If a `loss_aggregator` is specified, all '
                          '`loss_names` on the learner are expected to be None.')
-      self._loss_aggregator = instantiate(p.loss_aggregator)
+      self._loss_aggregator_inst = instantiate(p.loss_aggregator)
     else:
       if self._learners[0].loss_name is None:
         raise ValueError('`loss_name` on the learner is None. Must be set.')
       loss_p = base_metrics.LossAggregator.HParams(
           loss_key=self._learners[0].loss_name)
-      self._loss_aggregator = instantiate(loss_p)
+      self._loss_aggregator_inst = instantiate(loss_p)
 
     if p.infer_writer:
       self._inference_runner = p.infer_writer.inference_runner.Instantiate(
-          model=self._model)
+          model=self._model_inst
+      )
 
   @property
   def learners(self) -> Sequence[learners_lib.Learner]:
@@ -727,7 +1010,7 @@ class SingleTask(base_task.BaseTask):
 
   @property
   def model(self) -> base_model.BaseModel:
-    return self._model
+    return self._model_inst
 
   @property
   def metrics_aggregator(self) -> base_metrics.MeanMetrics:
@@ -735,7 +1018,7 @@ class SingleTask(base_task.BaseTask):
 
   @property
   def loss_aggregator(self) -> base_metrics.LossAggregator:
-    return self._loss_aggregator
+    return self._loss_aggregator_inst
 
   @property
   def has_ema_decay(self):
@@ -761,9 +1044,7 @@ class SingleTask(base_task.BaseTask):
     Returns:
       A list of NestedJTensor to update `opt_states` in TrainState.
     """
-    grad_txs = [x.get_grad_tx(var_weight_hparams) for x in self.learners]
-    asserts.assert_same_structure(mdl_vars, var_weight_hparams)
-    return [x.init(mdl_vars) for x in grad_txs]
+    return _create_opt_states(mdl_vars, var_weight_hparams, self.learners)
 
   def create_train_state(self,
                          mdl_vars: NestedJTensor,
@@ -783,20 +1064,9 @@ class SingleTask(base_task.BaseTask):
     Returns:
       a TrainState.
     """
-    # Make a private copy of mdl_vars and var_weight_hparams structures that are
-    # not shared with the caller.
-    mdl_vars = jax.tree_util.tree_map(lambda x: x, mdl_vars)
-    var_weight_hparams = jax.tree_util.tree_map(lambda x: x, var_weight_hparams)
-    if discard_opt_states:
-      opt_states = {}
-    else:
-      opt_states = self.create_opt_states(mdl_vars, var_weight_hparams)
-
-    return TrainState(
-        # The global step for the model.
-        step=jnp.array(0, dtype=jnp.uint32),
-        mdl_vars=mdl_vars,
-        opt_states=opt_states)
+    return create_state(
+        mdl_vars, var_weight_hparams, discard_opt_states, self.learners
+    )
 
   def create_train_state_padded_shapes(self,
                                        var_weight_hparams,
@@ -814,33 +1084,15 @@ class SingleTask(base_task.BaseTask):
       A TrainState contains jax.ShapeDtypeStruct for all the forward and
         backward variables.
     """
-    unpadded_shapes = self.create_train_state_unpadded_shapes(
-        var_weight_hparams, discard_opt_states)
     mesh_shape = self.hparams.model.mesh_shape
     mesh_axis_names = self.hparams.model.mesh_axis_names
-    if mesh_shape is None:
-      return unpadded_shapes
-
-    model_state_partition_specs = self.create_train_state_partition_specs(
-        var_weight_hparams, discard_opt_states)
-    asserts.assert_same_structure(model_state_partition_specs, unpadded_shapes)
-
-    def _maybe_pad(shape_dtype, pspec):
-      if py_utils.is_optax_masked_node(shape_dtype):
-        return shape_dtype
-      unpadded_shape = shape_dtype.shape
-      paddings = py_utils.get_uneven_sharding_paddings(pspec, unpadded_shape,
-                                                       mesh_shape,
-                                                       mesh_axis_names)
-      padded_shape = [s + p for (s, p) in zip(unpadded_shape, paddings)]
-      return jax.ShapeDtypeStruct(padded_shape, shape_dtype.dtype)
-
-    padded_shapes = jax.tree_map(
-        _maybe_pad,
-        unpadded_shapes,
-        model_state_partition_specs,
-        is_leaf=py_utils.is_optax_masked_node)
-    return padded_shapes
+    return create_state_padded_shapes(
+        var_weight_hparams,
+        mesh_shape,
+        mesh_axis_names,
+        discard_opt_states,
+        self.learners,
+    )
 
   def create_train_state_unpadded_shapes(self,
                                          var_weight_hparams,
@@ -860,17 +1112,9 @@ class SingleTask(base_task.BaseTask):
         backward variables.
     """
 
-    def _get_shape(var_param):
-      shape = tuple(var_param.repeat_prefix or ()) + tuple(var_param.shape)
-      return jax.ShapeDtypeStruct(shape, var_param.dtype)
-
-    var_shapes = jax.tree_map(_get_shape, var_weight_hparams)
-
-    def _create_train_state_from_shape(mdl_vars):
-      return self.create_train_state(mdl_vars, var_weight_hparams,
-                                     discard_opt_states)
-
-    return jax.eval_shape(_create_train_state_from_shape, var_shapes)
+    return create_state_unpadded_shapes(
+        var_weight_hparams, discard_opt_states, self.learners
+    )
 
   def create_train_state_partition_specs(self,
                                          var_weight_hparams,
@@ -890,44 +1134,14 @@ class SingleTask(base_task.BaseTask):
     mesh_shape = p.model.mesh_shape
     if mesh_shape is None:
       return None
-    step_partition_spec = PartitionSpec()
-    var_partition_specs = base_layer.var_partition_specs(
+    mesh_axis_names = p.model.mesh_axis_names
+    return create_state_partition_specs(
         var_weight_hparams,
-        mesh_shape=mesh_shape,
-        device_axis_names=p.model.mesh_axis_names)
-    if discard_opt_states:
-      opt_var_partition_specs = {}
-    else:
-      grad_txs = [x.get_grad_tx(var_weight_hparams) for x in self.learners]
-      opt_var_weight_hparams = []
-      for grad_tx in grad_txs:
-        assert isinstance(grad_tx, optimizers.ShardedGradientTransformation)
-        opt_var_weight_hparams.append(
-            grad_tx.init_partition_spec(var_weight_hparams))
-      opt_var_partition_specs = base_layer.var_partition_specs(
-          opt_var_weight_hparams,
-          mesh_shape=mesh_shape,
-          device_axis_names=p.model.mesh_axis_names)
-
-      # Note that due to the double nesting of sharded chain we need to un-mask
-      # the outer MaskedState() if present. If this is only a single optimizer
-      # the tree_map() will go through with a no-op.
-      def _is_instance_masked_state(x):
-        return isinstance(x, optax.MaskedState)
-
-      def _maybe_unmask_outer_masked_state(x):
-        if _is_instance_masked_state(x):
-          return x.inner_state
-        return x
-
-      opt_var_partition_specs = jax.tree_map(
-          _maybe_unmask_outer_masked_state,
-          opt_var_partition_specs,
-          is_leaf=_is_instance_masked_state)
-    return TrainState(
-        step=step_partition_spec,
-        mdl_vars=var_partition_specs,
-        opt_states=opt_var_partition_specs)
+        mesh_shape,
+        mesh_axis_names,
+        discard_opt_states,
+        self.learners,
+    )
 
   def maybe_adjust_train_state(self, step: int, mdl_vars: Dict[
       str, JTensor], var_weight_hparams: Nested[base_layer.WeightHParams],
@@ -1004,7 +1218,7 @@ class SingleTask(base_task.BaseTask):
       ckpt_path: str,
       rules: CheckpointLoadingRules,
       load_status: List[Any],
-      global_mesh: Optional[maps.Mesh] = None,
+      global_mesh: Optional[jax.sharding.Mesh] = None,
       checkpoint_type: CheckpointType = CheckpointType.CHECKPOINT_FLAX,
       target_partition_specs: Optional[TrainState] = None):
     """Applies one CheckpointLoadingRules to train_state."""
@@ -1036,9 +1250,10 @@ class SingleTask(base_task.BaseTask):
     train_state_pspecs = ckpt_task.create_train_state_partition_specs(
         var_weight_hparams)
 
-    load_ema_state = (
-        hasattr(rules.task_p, 'train') and
-        rules.task_p.train.learner.optimizer.ema_decay > 0.0)
+    load_ema_states = (
+        hasattr(rules.task_p, 'train')
+        and rules.task_p.train.learner.optimizer.ema_decay > 0.0
+    ) and rules.load_ema_states
 
     loading_rules = [
         (re.compile(pattern), ref) for pattern, ref in rules.load_rules
@@ -1061,8 +1276,12 @@ class SingleTask(base_task.BaseTask):
 
     if uses_gda:
       ckpt_train_state, train_state_pspecs = _make_gda_train_state(
-          rules, ckpt_train_state, train_state_pspecs, matched_pspecs,
-          load_ema_state)
+          rules,
+          ckpt_train_state,
+          train_state_pspecs,
+          matched_pspecs,
+          load_ema_states,
+      )
 
     if (py_utils.pmap_use_tensorstore() and
         ckpt_task.model.hparams.ici_mesh_shape is None):
@@ -1082,8 +1301,7 @@ class SingleTask(base_task.BaseTask):
           global_mesh=global_mesh,
           checkpoint_type=checkpoint_type,
           state_specs=train_state_pspecs,
-          step=rules.step,
-          use_orbax=True)
+          step=rules.step)
 
     if loaded_train_state is None:
       raise RuntimeError(f'Cannot find checkpoint from {ckpt_path}')
@@ -1091,7 +1309,7 @@ class SingleTask(base_task.BaseTask):
     loaded_vars = dict(NestedMap(loaded_train_state.mdl_vars).FlattenItems())
 
     # Load EMA state if specified
-    if load_ema_state:
+    if load_ema_states:
       # TODO(pax-dev): This doesn't work with prefix dims.
       for v in loaded_train_state.opt_states[0]:
         if 'ema' in v:
@@ -1144,7 +1362,7 @@ class SingleTask(base_task.BaseTask):
       self,
       train_state: TrainState,
       train_state_partition_specs: Optional[TrainState] = None,
-      global_mesh: Optional[maps.Mesh] = None,
+      global_mesh: Optional[jax.sharding.Mesh] = None,
       checkpoint_type: CheckpointType = CheckpointType.CHECKPOINT_FLAX,
   ) -> Tuple[TrainState, bool]:
     """Applies p.train.init_from_checkpoint_rules to update train_state.

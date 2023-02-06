@@ -21,13 +21,14 @@ import jax
 import jax.numpy as jnp
 from paxml import base_experiment
 from paxml import experiment_registry
+from paxml import learners
 from paxml import tasks_lib
 from paxml.tasks.vision import input_generator
 from praxis import base_input
 from praxis import base_layer
 from praxis import layers
-from praxis import learners
 from praxis import optimizers
+from praxis import pax_fiddle
 from praxis import py_utils
 from praxis import pytypes
 from praxis import schedules
@@ -37,6 +38,7 @@ FLAGS = flags.FLAGS
 WeightInit = base_layer.WeightInit
 NestedMap = py_utils.NestedMap
 NestedShapeDtypeStruct = pytypes.NestedShapeDtypeStruct
+LayerTpl = pax_fiddle.Config[base_layer.BaseLayer]
 
 
 class ImageClassificationInputSpecsProvider(base_input.BaseInputSpecsProvider):
@@ -142,13 +144,15 @@ class ResNet50Pjit(base_experiment.BaseExperiment):
     """Returns a list of dataset configs."""
     return [self._dataset_train(), self._dataset_test()]
 
-  def _network(self) -> base_layer.BaseLayer.HParams:
+  def _network(self) -> LayerTpl:
     net = layers.ResNet.HParamsResNet50()
     # Zero-init BN-gamma in the residual branch, needed to support larger
     # batch size training. See Table 2(b) in "ImageNet in 1 hour".
     # Note that this also requires optimizer.skip_lp_1d_vectors=True due to
     # reparameterization.
-    net.block_params = layers.ResNetBlock.HParams(zero_init_residual=True)
+    net.block_params = pax_fiddle.Config(
+        layers.ResNetBlock, zero_init_residual=True
+    )
     return net
 
   def _optimizer(self) -> optimizers.BaseOptimizer.HParams:
@@ -224,13 +228,16 @@ class ResNet50Pjit(base_experiment.BaseExperiment):
     """Returns the task configs."""
     resnet = self._network()
     task_p = tasks_lib.SingleTask.HParams(name='classifier_task')
-    task_p.model = layers.ClassificationModel.HParams(
+    task_p.model = pax_fiddle.Config(
+        layers.ClassificationModel,
         name='classifier',
         network_tpl=resnet,
-        softmax_tpl=layers.FullSoftmax.HParams(
+        softmax_tpl=pax_fiddle.Config(
+            layers.FullSoftmax,
             params_init=WeightInit.Gaussian(scale=0.01),
             input_dims=resnet.channels[-1],  # pytype: disable=attribute-error
             num_classes=1000,
-        ))
+        ),
+    )
     task_p = self._configure_task(task_p)
     return task_p

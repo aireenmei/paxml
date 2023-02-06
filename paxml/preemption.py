@@ -13,26 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Test model configuration using synthetic data."""
-
-from paxml import base_experiment
-from paxml import experiment_registry
-from praxis import layers
-from praxis import pax_fiddle
+"""Utils for preemption."""
+import jax
+from jax.experimental import multihost_utils
 
 
-@experiment_registry.register
-class SyntheticClassifier(base_experiment.BaseExperiment):
-  # TODO(shafey): Implement a real test model.
-
-  def datasets(self):
-    return []
-
-  def task(self):
-    act_p = pax_fiddle.Config(layers.Identity)
-    return act_p
-
-
-@experiment_registry.register
-class SharedNameExperiment(SyntheticClassifier):
-  pass
+def reached_preemption_sync_point(step: int) -> bool:
+  """Determine whether all hosts have reached a preemption sync point."""
+  return (jax.config.jax_coordination_service and
+          multihost_utils.reached_preemption_sync_point(step))
