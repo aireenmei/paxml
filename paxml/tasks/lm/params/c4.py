@@ -888,7 +888,7 @@ class C4Spmd32BAdam64Replicas(C4SpmdAdam):
     return task_p
 
 @experiment_registry.register
-class C4Spmd128BAdam256Replicas_1(c4.C4SpmdAdam):
+class C4Spmd128BAdam256Replicas_1(C4SpmdAdam):
   r"""GPT-3 config with 128B params. Model Parameters: 
   Global batch size = 1 * 64 * 4 * 8 = 1024"""
   NUM_LAYERS = 71
@@ -907,7 +907,7 @@ class C4Spmd128BAdam256Replicas_1(c4.C4SpmdAdam):
   ICI_MESH_SHAPE = [1, 64, 4]
 
 @experiment_registry.register
-class C4Spmd128BAdam256Replicas_2(c4.C4SpmdAdam):
+class C4Spmd128BAdam256Replicas_2(C4SpmdAdam):
   r"""GPT-3 config with 128B params. Model Parameters: 
   Global batch size = 1 * 64 * 4 * 8 = 1024"""
   NUM_LAYERS = 71
