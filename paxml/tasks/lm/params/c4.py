@@ -944,7 +944,7 @@ class C4Spmd128BAdam256Replicas_mlperf_batch512(C4SpmdAdam):
   CHECKPOINT_POLICY = layers.AutodiffCheckpointType.SAVE_DOT_FOR_MLPERF_200B
   ICI_MESH_SHAPE = [1, 64, 4]
 
-  @experiment_registry.register
+@experiment_registry.register
 class C4Spmd128BAdam256Replicas_mlperf_batch1024(C4SpmdAdam):
   r"""GPT-3 config with 128B params. Model Parameters: 
   Global batch size = 1 * 64 * 4 * 4 = 1024"""
