@@ -233,6 +233,7 @@ class LmCloudSpmd128B(LmCloudSpmd):
   MODEL_DIMS = 12288
   HIDDEN_DIMS = MODEL_DIMS * 4
 
+  SUMMARY_INTERVAL_STEPS = 10
   CHECKPOINT_POLICY = layers.AutodiffCheckpointType.SAVE_NOTHING
   ICI_MESH_SHAPE = [1, 64, 4]
 
