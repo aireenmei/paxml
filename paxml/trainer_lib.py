@@ -403,6 +403,8 @@ def initialize_model_state(
       return model.init(init_key, inputs)
 
   initial_vars = init_fn(init_key)
+  param_count = sum(x.size for x in jax.tree_leaves(initial_vars))
+  logging.info('Model Parameters: %d', param_count) 
   logging.info('initial_vars: %s', jax.tree_map(lambda x: x.shape,
                                                 initial_vars))
 

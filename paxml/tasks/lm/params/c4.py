@@ -1012,26 +1012,24 @@ class C4SpmdGpt3L16AdamOrgHP(C4SpmdGpt3AdamOrgHP):
 
 
 @experiment_registry.register
-class C4SpmdPipelineGpt3SmallAdam64Replicas(C4SpmdPipelineGpt3AdamOrgHP):
-  """Small GPT-3 config in bf16 for 64 replicas with 512 global batch size.
-
-  This was called GPT-3 XL in the GPT-3 paper, with 1.3B parameters.
+class C4SpmdOpt1BAdam64Replicas(C4SpmdGpt3AdamOrgHP):
+  """Opt 1.3B config in bf16 for 64 replicas with 512 global batch size.
+  1M tokens per global batch
   """
-  NUM_STAGES = 4
+  
   NUM_LAYERS = 24
-  NUM_HEADS = 24
-  MODEL_DIMS = 3072
+  NUM_HEADS = 32
+  MODEL_DIMS = 2048
   # Known as MLP_DIM in t5x
   HIDDEN_DIMS = MODEL_DIMS * 4
-  DIMS_PER_HEAD = 128
+  DIMS_PER_HEAD = MODEL_DIMS // NUM_HEADS
 
   PER_CORE_BATCH_SIZE = 8
-  MICROBATCH_SIZE = 16
   FPROP_DTYPE = jnp.bfloat16
-  LEARNING_RATE = 2.0e-4
-  ICI_MESH_SHAPE = [4, 1, 4, 4]
+  LEARNING_RAT = 2e-4
+  ICI_MESH_SHAPE = [1, 16, 4]
 
   CHECKPOINT_MAX_TO_KEEP = 1000
   EVAL_INTERVAL_STEPS = 100
-  SUMMARY_INTERVAL_STEPS = 1
+  SUMMARY_INTERVAL_STEPS = 10
   CHECKPOINT_EVERY_N_STEPS = 200
