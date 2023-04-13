@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 Google LLC.
+# Copyright 2022 The Pax Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,38 +15,50 @@
 
 """Module to manage checkpoint metadata and automatic checkpoint deletion."""
 
+import concurrent
 import dataclasses
+import functools
 import typing
 from typing import Any, Mapping, Optional, Sequence, Union
 
 from etils import epath
+from absl import logging
 import jax
 import orbax.checkpoint
-from paxml import checkpoint_pb2
 from paxml import checkpoints
+from praxis import base_input
 from praxis import py_utils
+from praxis import pytypes
 import tensorflow.compat.v2 as tf
 
 from paxml import preemption  # mapped to internal
 
 
-CheckpointType = checkpoint_pb2.CheckpointType
+CheckpointType = checkpoints.CheckpointType
+Nested = pytypes.Nested
+# TODO(pax-dev): pytyping doesn't like either
+# Optional[pytypes.NestedShapeDtypeStruct]
+# or pytypes.NestedShapeDtypeStruct | None,
+# Switch to the right type hint once pytyping versions are in sync.
+OptionalNestedShapeDtypeStruct = Any
+
 
 CHECKPOINT_PREFIX = 'checkpoint_'
 STATE_ITEM_NAME = checkpoints.STATE_ITEM_NAME
 METADATA_ITEM_NAME = checkpoints.METADATA_ITEM_NAME
+INPUT_ITEM_NAME = checkpoints.INPUT_ITEM_NAME
 
 _SUPPORTED_ITEMS = frozenset({STATE_ITEM_NAME, METADATA_ITEM_NAME})
 
 
 def _get_checkpoint_version(
-    step: int, checkpoint_type: CheckpointType, directory: epath.Path
+    checkpoint_type: CheckpointType, directory: epath.Path, step: int
 ) -> float:
   """Gets checkpoint version from saved metadata."""
   checkpoint_step_dir = checkpoints.make_checkpoint_step_dir(
       directory, step, checkpoint_type=checkpoint_type
   )
-  version = 0.
+  version = 0.0
   # Necessary because some checkpoints do not conform to Orbax directory
   # structure. Could rely exclusively on actual version if all checkpoints
   # conformed.
@@ -64,14 +76,25 @@ def _update_args_with_version(item_kwargs, version):
   return kwargs
 
 
-def _create_items_dict_with_metadata(item, version):
-  items = {
-      STATE_ITEM_NAME: item,
-  }
+def _create_items_dict_with_metadata(
+    train_state,
+    train_state_unpadded_shape_dtype_struct,
+    version,
+    tensorstore_use_ocdbt: Optional[bool] = None
+):
+  """Returns items dict with metadata."""
+  # (padded) train_state
+  items = {STATE_ITEM_NAME: train_state}
+
   if version > 0:
-    items.update(
-        {METADATA_ITEM_NAME: checkpoints.make_metadata(version=version)}
+    metadata = checkpoints.make_metadata(
+        version,
+        train_state,
+        train_state_unpadded_shape_dtype_struct,
+        tensorstore_use_ocdbt=tensorstore_use_ocdbt
     )
+    items.update({METADATA_ITEM_NAME: metadata})
+
   return items
 
 
@@ -87,6 +110,7 @@ class CheckpointManagerOptions(orbax.checkpoint.CheckpointManagerOptions):
       deleted from the file system. Useful if checkpoint deletion is time
       consuming. By default, delete the checkpoint assets.
   """
+
   todelete_subdir: Optional[str] = None
 
 
@@ -108,14 +132,15 @@ class _CheckpointManagerImpl(orbax.checkpoint.CheckpointManager):
       self,
       directory: epath.PathLike,
       *args,
-      checkpoint_type: CheckpointType = CheckpointType.CHECKPOINT_UNSPECIFIED,
+      checkpoint_type: CheckpointType = CheckpointType.UNSPECIFIED,
+      tensorstore_use_ocdbt: Optional[bool] = None,
       **kwargs,
   ):
-    if checkpoint_type == CheckpointType.CHECKPOINT_UNSPECIFIED:
+    if checkpoint_type == CheckpointType.UNSPECIFIED:
       raise ValueError('Must specify checkpoint type.')
     self._checkpoint_type = checkpoint_type
 
-    self._version = checkpoints.get_version()
+    self._version = checkpoints.get_version(tensorstore_use_ocdbt)
     # Check for existing checkpoints and retrieve version information. The
     # specific version may impact the checkpoint format, so it must be known in
     # advance of any operations.
@@ -123,10 +148,19 @@ class _CheckpointManagerImpl(orbax.checkpoint.CheckpointManager):
     if self._directory.exists():
       steps = self.all_steps(read=True)
       if steps:
-        versions = [
-            _get_checkpoint_version(s, self._checkpoint_type, self._directory)
-            for s in steps
-        ]
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(steps)
+        ) as pool:
+          versions = list(
+              pool.map(
+                  functools.partial(
+                      _get_checkpoint_version,
+                      self._checkpoint_type,
+                      self._directory,
+                  ),
+                  steps,
+              )
+          )
         if not all(v == versions[0] for v in versions):
           raise ValueError('Expected all checkpoints to have the same version.')
         self._version = versions[0]
@@ -150,7 +184,8 @@ class _CheckpointManagerImpl(orbax.checkpoint.CheckpointManager):
     if preemption.reached_preemption_sync_point(step):
       return True
     last_checkpoint_step = (
-        self._last_checkpoint.step if self._last_checkpoint else None)
+        self._last_checkpoint.step if self._last_checkpoint else None
+    )
     # Ensure current step is between the last step and next step (accounting for
     # save interval). The `last_checkpoint_step` may not be initialized, in
     # which case we should save. Otherwise, step must fall on the specified
@@ -158,20 +193,34 @@ class _CheckpointManagerImpl(orbax.checkpoint.CheckpointManager):
     # on preemption, in which case we want to maintain the same save period as
     # if preemption had not happened.
     return last_checkpoint_step is None or (
-        last_checkpoint_step < step and
-        step % self._options.save_interval_steps == 0)
-
-  def _get_save_directory(self,
-                          step: int,
-                          directory: epath.Path,
-                          key_name: Optional[str] = None) -> epath.Path:
-    """Returns the standardized path to a save directory for a single item."""
-    step_dir = checkpoints.make_checkpoint_step_dir(
-        directory, step, checkpoint_type=self._checkpoint_type
+        last_checkpoint_step < step
+        and step % self._options.save_interval_steps == 0
     )
+
+  def _get_save_directory(
+      self,
+      step: int,
+      directory: epath.Path,
+      key_name: Optional[str] = None,
+      tmp_directory: Optional[epath.Path] = None,
+  ) -> epath.Path:
+    """Returns the standardized path to a save directory for a single item."""
+    if tmp_directory is None:
+      step_dir = checkpoints.make_checkpoint_step_dir(
+          directory, step, checkpoint_type=self._checkpoint_type
+      )
+    else:
+      step_dir = tmp_directory
     if self._version < 1 or key_name is None:
       return step_dir
     return step_dir / key_name
+
+  def _create_tmp_directory(self, directory: epath.Path) -> epath.Path:
+    if self._version < 1:
+      # Construct the path without returning. This is because Checkpointer must
+      # be allowed to create the path. Only needed for legacy compatibility.
+      return orbax.checkpoint.utils.get_tmp_directory(directory)
+    return super()._create_tmp_directory(directory)
 
   def _cleanup_tmp_directories(self):
     if py_utils.is_mock_tpu_backend():
@@ -197,7 +246,7 @@ class _CheckpointManagerImpl(orbax.checkpoint.CheckpointManager):
       super()._delete_directory(step)
 
   def structure(self) -> Union[Any, Mapping[str, Any]]:
-    if self._checkpoint_type == CheckpointType.CHECKPOINT_FLAX:
+    if self._checkpoint_type == CheckpointType.FLAX:
       raise ValueError('`structure` not supported for Flax format checkpoints.')
     return super().structure()
 
@@ -209,20 +258,27 @@ class OrbaxCheckpointManager:
       self,
       directory: epath.Path,
       checkpointer: orbax.checkpoint.AbstractCheckpointer,
+      train_input_checkpointer: Optional[orbax.checkpoint.Checkpointer] = None,
       options: Optional[CheckpointManagerOptions] = None,
-      checkpoint_type: CheckpointType = CheckpointType.CHECKPOINT_UNSPECIFIED,
+      checkpoint_type: CheckpointType = CheckpointType.UNSPECIFIED,
+      tensorstore_use_ocdbt: Optional[bool] = None,
   ):
+    self._tensorstore_use_ocdbt = tensorstore_use_ocdbt
     checkpointers = {
-        checkpoints.STATE_ITEM_NAME: checkpointer,
+        STATE_ITEM_NAME: checkpointer,
         METADATA_ITEM_NAME: orbax.checkpoint.Checkpointer(
             orbax.checkpoint.JsonCheckpointHandler()
         ),
     }
+
+    if train_input_checkpointer:
+      checkpointers[INPUT_ITEM_NAME] = train_input_checkpointer
     self._manager = _CheckpointManagerImpl(
         directory,
         checkpointers,
         options=options,
         checkpoint_type=checkpoint_type,
+        tensorstore_use_ocdbt=tensorstore_use_ocdbt,
     )
 
   @property
@@ -248,26 +304,90 @@ class OrbaxCheckpointManager:
   def should_save(self, step: int) -> bool:
     return self._manager.should_save(step)
 
+  def _train_checkpoint_exists(self, step: int) -> bool:
+    path = self._manager._get_save_directory(  # pylint: disable=protected-access
+        step, self.directory, INPUT_ITEM_NAME
+    )
+    return path.exists()
+
   def save(
       self,
       step: int,
       train_state: Any,
+      train_state_unpadded_shape_dtype_struct: OptionalNestedShapeDtypeStruct = None,
+      train_input_pipeline: Optional[base_input.BaseInput] = None,
       force: Optional[bool] = False,
   ) -> bool:
+    """See superclass documentation."""
+    if self.version > 1.0 and train_state_unpadded_shape_dtype_struct is None:
+      raise ValueError(
+          """For checkpoint version > 1.0, we require users to provide
+          `train_state_unpadded_shape_dtype_struct` during checkpoint
+          saving/restoring, to avoid potential silent bugs when loading
+          checkpoints to incompatible unpadded shapes of TrainState."""
+      )
+
+    # save_kwargs
     save_kwargs = _update_args_with_version(None, self.version)
-    items = _create_items_dict_with_metadata(train_state, self.version)
+
+    # items
+    items = _create_items_dict_with_metadata(
+        train_state,
+        train_state_unpadded_shape_dtype_struct,
+        self.version,
+        tensorstore_use_ocdbt=self._tensorstore_use_ocdbt,
+    )
+
+    if train_input_pipeline:
+      items[INPUT_ITEM_NAME] = train_input_pipeline
+
     return self._manager.save(step, items, save_kwargs=save_kwargs, force=force)
 
   def restore(
       self,
       step: int,
       train_state: Any,
+      train_state_unpadded_shape_dtype_struct: OptionalNestedShapeDtypeStruct = None,
+      train_input_pipeline: Optional[base_input.BaseInput] = None,
       restore_kwargs: Optional[Any] = None,
-  ) -> Union[Any, Mapping[str, Any]]:
+  ) -> Any:
     """See superclass documentation."""
+    if self.version > 1.0 and train_state_unpadded_shape_dtype_struct is None:
+      raise ValueError(
+          """For checkpoint version > 1.0, we require users to provide
+          `train_state_unpadded_shape_dtype_struct` during checkpoint
+          saving/restoring, to avoid potential silent bugs when loading
+          checkpoints to incompatible unpadded shapes of TrainState.""")
+
     # Propagate version to CheckpointHandler.
     restore_kwargs = _update_args_with_version(restore_kwargs, self.version)
-    items = _create_items_dict_with_metadata(train_state, self.version)
-    return self._manager.restore(
+
+    items = _create_items_dict_with_metadata(
+        train_state,
+        train_state_unpadded_shape_dtype_struct,
+        self.version,
+        tensorstore_use_ocdbt=self._tensorstore_use_ocdbt,
+    )
+
+    # Train input checkpoint may not exist if input checkpointing wasn't
+    # previously enabled
+    if train_input_pipeline and self._train_checkpoint_exists(step):
+      items[INPUT_ITEM_NAME] = train_input_pipeline
+
+    restored = self._manager.restore(
         step, items=items, restore_kwargs=restore_kwargs
-    )[STATE_ITEM_NAME]
+    )
+
+    if self.version > 1.0:
+      restored_metadata = checkpoints.PaxMetadata.from_dict(
+          restored[METADATA_ITEM_NAME]
+      )
+      metadata = checkpoints.PaxMetadata.from_dict(items[METADATA_ITEM_NAME])
+      if not metadata.is_compatible(restored_metadata):
+        raise ValueError(
+            'PaxMetadata is not compatible with the restored PaxMetadata. '
+            f'expected PaxMetadata = {restored_metadata}. '
+            f'actual PaxMetadata = {metadata}.'
+        )
+
+    return restored[STATE_ITEM_NAME]

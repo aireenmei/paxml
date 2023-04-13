@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 Google LLC.
+# Copyright 2022 The Pax Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,8 +15,10 @@
 
 """Tests for automl."""
 
+import dataclasses
 import math
-from typing import Callable, Dict, List, Optional, Type
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
+
 from absl.testing import absltest
 from clu import platform
 from etils import epath
@@ -25,39 +27,47 @@ from paxml import base_experiment
 from paxml import trainer_lib
 from paxml import tuning_lib
 from praxis import base_hyperparams
-
 import pyglove as pg
 
 
 class StopWithLowerMetric(automl.BaseReward):
+  metric: Optional[automl.Metric] = None
+  threshold: Union[float, List[Tuple[int, float]]] = 0.0
+  skip: bool = False
+  reward_replacement: Optional[float] = None
+  metrics_replacement: Optional[Dict[str, float]] = None
 
-  class HParams(automl.BaseReward.HParams):
-    metric: Optional[automl.Metric] = None
-    threshold: float = 0.0
-    skip: bool = False
-    reward_replacement: Optional[float] = None
-    metrics_replacement: Optional[Dict[str, float]] = None
+  def get_threshold(self, global_step: int) -> float:
+    if isinstance(self.threshold, float):
+      return self.threshold
+    for i, (step, value) in enumerate(self.threshold):
+      if step <= global_step and (
+          i == len(self.threshold) - 1 or self.threshold[i + 1][0] > global_step
+      ):
+        return value
+    return 0.0
 
   def __call__(self, metrics_dict: Dict[str, float], global_step: int) -> float:
-    p = self._hparams
-    reward = p.metric.get_value(metrics_dict)
-    if reward < p.threshold:
-      if p.skip:
+    reward = self.metric.get_value(metrics_dict)
+    if reward < self.get_threshold(global_step):
+      if self.skip:
         raise automl.EarlyStoppingError(
-            skip=p.skip,
+            skip=self.skip,
             skip_reason='Trial skipped due to lower metric value.',
-            step=global_step)
+            step=global_step,
+        )
       else:
         raise automl.EarlyStoppingError(
             skip=False,
             step=global_step,
-            reward=p.reward_replacement,
-            metrics=p.metrics_replacement)
+            reward=self.reward_replacement,
+            metrics=self.metrics_replacement,
+        )
     return reward
 
   @property
   def used_metrics(self):
-    return [self._hparams.metric]
+    return [self.metric]
 
 
 class MockTask(pg.Dict):
@@ -66,21 +76,17 @@ class MockTask(pg.Dict):
     return 'MOCK_TASK_CONFIG'
 
 
-class MockDataset(base_hyperparams.BaseParameterizable):
+class MockDataset(base_hyperparams.FiddleBaseParameterizable):
+  dataset_param1: Optional[str] = None
+  dataset_param2: Optional[Callable[[], int]] = None
+  is_training: bool = False
+  param1: Any = dataclasses.field(init=False, repr=False)
+  param2: Any = dataclasses.field(init=False, repr=False)
 
-  class HParams(base_hyperparams.BaseParameterizable.HParams):
-    dataset_param1: Optional[str] = None
-    dataset_param2: Optional[Callable[[], int]] = None
-    is_training: bool = False
-
-    def to_text(self) -> str:
-      return 'MOCK_DATASET_CONFIG'
-
-  def __init__(self, hparams):
-    super().__init__(hparams)
-    self.param1 = hparams.dataset_param1
-    if callable(hparams.dataset_param2):
-      self.param2 = hparams.dataset_param2()
+  def __post_init__(self):
+    self.param1 = self.dataset_param1
+    if callable(self.dataset_param2):
+      self.param2 = self.dataset_param2()
 
 
 class TuningExperiment(base_experiment.BaseExperiment):
@@ -205,6 +211,19 @@ class TuningWithPerTrialEarlyStopping(TuningExperiment):
     return search_hparams
 
 
+class TuningWithTreatingEarlyStoppedTrailsAsDone(TuningExperiment):
+  """A faked tuning experiment for treating early stopped trials as done."""
+
+  def search(self):
+    search_hparams = super().search()
+    search_hparams.search_reward = StopWithLowerMetric.HParams(
+        metric=automl.Metric.eval('reward'),
+        threshold=[(10, 0.5), (20, 2.0)],
+        skip=True)
+    search_hparams.treats_early_stopped_trials_as_done = True
+    return search_hparams
+
+
 class TuningWithPerTrialEarlyStoppingAndRewardReplacement(TuningExperiment):
   """A faked experiemnt with per-trial early stopping and reward replacement."""
 
@@ -283,8 +302,7 @@ def run_experiment(experiment_config: base_experiment.BaseExperiment,
       global_step=10,
       is_last_ckpt=False,
       eval_metrics=tuning_lib.EvalMetrics(
-          # Fake BaseInput.HParams using pg.Dict as only `name` was accessed.
-          input_p=[pg.Dict(name='abc')],
+          input_names=['abc'],
           metrics_list=[dict(reward=reward)],
           steps_per_sec=1.0)):
     return
@@ -300,13 +318,11 @@ def run_experiment(experiment_config: base_experiment.BaseExperiment,
       global_step=20,
       is_last_ckpt=True,
       eval_metrics=tuning_lib.EvalMetrics(
-          # Fake BaseInput.HParams using pg.Dict as only `name` was accessed.
-          input_p=[pg.Dict(name='abc')],
+          input_names=['abc'],
           metrics_list=[dict(reward=reward * 3)],
           steps_per_sec=1.0),
       decode_metrics=tuning_lib.DecodeMetrics(
-          # Fake BaseInput.HParams using pg.Dict as only `name` was accessed.
-          input_p=[pg.Dict(name='abc')],
+          input_names=['abc'],
           metrics_list=[dict(reward=reward * 3)],
           steps_per_sec=1.0)):
     return
@@ -429,8 +445,11 @@ class TuneTest(absltest.TestCase):
     self.assertEqual([t.final_measurement.step for t in result.trials],
                      [0, 21, 21, 21, 21])
     # Make sure experiment config is saved as trial metadata.
+    actual = result.trials[0].metadata.get('experiment_config')
+    actual['config']['']['datasets'][0] = 'MOCK_DATASET_CONFIG'
+    actual['config']['']['decoder_datasets'][0] = 'MOCK_DATASET_CONFIG'
     self.assertEqual(
-        result.trials[0].metadata.get('experiment_config'),
+        actual,
         {
             'format_version': 1.0,
             'source': 'pax',
@@ -438,9 +457,11 @@ class TuneTest(absltest.TestCase):
                 '': pg.Dict(
                     datasets=['MOCK_DATASET_CONFIG'],
                     decoder_datasets=['MOCK_DATASET_CONFIG'],
-                    task='MOCK_TASK_CONFIG')
-            }
-        })
+                    task='MOCK_TASK_CONFIG',
+                )
+            },
+        },
+    )
 
   def test_parameter_sweep_with_catesian_product(self):
     search_space = tuning_lib.get_search_space(
@@ -493,6 +514,24 @@ class TuneTest(absltest.TestCase):
     self.assertLen(result.trials, 5)
     self.assertEqual([t.status for t in result.trials], ['COMPLETED'] * 5)
     self.assertEqual([t.infeasible for t in result.trials], [True] * 5)
+
+  def test_tune_with_treating_early_stopped_trials_as_done(self):
+    job_log_dir = epath.Path(absltest.get_default_test_tmpdir())
+    tuning_lib.tune(run_experiment,
+                    TuningWithTreatingEarlyStoppedTrailsAsDone(),
+                    platform.work_unit(),
+                    job_log_dir,
+                    study='local_treating_early_stopped_trials_as_done',
+                    max_num_trials=5)
+    result = pg.tuning.poll_result(
+        'local_treating_early_stopped_trials_as_done')
+    self.assertLen(result.trials, 5)
+    self.assertEqual([t.status for t in result.trials], ['COMPLETED'] * 5)
+    self.assertEqual([t.infeasible for t in result.trials],
+                     [True, True, False, False, False])
+    final_rewards = [t.final_measurement.reward if t.final_measurement else 0
+                     for t in result.trials]
+    self.assertEqual(final_rewards, [0.0, 0.0, 3.2, 0.64, 0.64])
 
   def test_tune_with_per_trial_early_stopping(self):
     job_log_dir = epath.Path(absltest.get_default_test_tmpdir())

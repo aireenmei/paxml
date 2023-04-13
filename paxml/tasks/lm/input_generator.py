@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 Google LLC.
+# Copyright 2022 The Pax Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,14 +19,15 @@ from __future__ import annotations
 
 import ast
 import dataclasses
-import jax
-from typing import List, Optional
+from typing import Any, List, Optional, Union
 
 from absl import logging
+import jax
 from lingvo.core import base_input_generator
 from lingvo.core import layers as lingvo_layers
 from lingvo.core import ops
 from praxis import base_input
+from praxis import pax_fiddle
 from praxis import py_utils
 from praxis import pytypes
 import tensorflow.compat.v2 as tf
@@ -34,57 +35,66 @@ import tensorflow.compat.v2 as tf
 NestedMap = py_utils.NestedMap
 
 
+def make_masked_ml_data_augmenter(**kwargs):
+  p = lingvo_layers.MaskedLmDataAugmenter.Params()
+  for k, v in kwargs.items():
+    setattr(p, k, v)
+  return p
+
+
 class TFRecordBertInput(base_input.BaseInput):
-  """Input generator reading TFRecords of ids for MLPerf eval."""
+  """Input generator reading TFRecords of ids for MLPerf eval.
 
-  class HParams(base_input.BaseInput.HParams):
-    """Hyper-parameters for this input class.
+  Attributes:
+    input_file: String, path of an input file.
+    max_sequence_length: Maximum number of tokens to be present in a single
+      example.
+    max_predictions_per_seq: Maximum number of tokens that can be masked per
+      example.
+    eos_token_id: id for EOS token.
+    eval_data_size: The number of examples in the eval data. Set to 0 for
+      unknown.
+    file_buffer_size: How many records are buffered for random shuffling.
+    enable_packing: Whether to pack multiple documents on the same row.
+    prepacking_batch_size: Only used when p.enable_packing is set. Batch size
+      before packing. Note that this does not affect post-packing batch size but
+      may have a minor effect on how tight the packed output is.
+    remask: Whether to re-apply the masking on-the-fly. Should only be used on
+      the training data.
+    mlm_augmenter: params for masking. Only used when p.remask=True.
+    num_samples: For accounting purposes only.
+  """
 
-    Attributes:
-      input_file: String, path of an input file.
-      max_sequence_length: Maximum number of tokens to be present in a single
-        example.
-      max_predictions_per_seq: Maximum number of tokens that can be masked per
-        example.
-      eos_token_id: id for EOS token.
-      eval_data_size: The number of examples in the eval data. Set to 0 for
-        unknown.
-      file_buffer_size: How many records are buffered for random shuffling.
-      enable_packing: Whether to pack multiple documents on the same row.
-      prepacking_batch_size: Only used when p.enable_packing is set. Batch size
-        before packing. Note that this does not affect post-packing batch size
-        but may have a minor effect on how tight the packed output is.
-      remask: Whether to re-apply the masking on-the-fly. Should only be used on
-        the training data.
-      mlm_augmenter: params for masking. Only used when p.remask=True.
-      num_samples: For accounting purposes only.
-    """
-    # https://github.com/mlcommons/training/tree/master/language_model/tensorflow/bert#tfrecord-features
-    input_file: Optional[str] = None
-    max_sequence_length: int = 512
-    max_predictions_per_seq: int = 76
-    eos_token_id: int = 102
-    eval_data_size: int = 10000
-    file_buffer_size: int = 10000
-    enable_packing: bool = False
-    prepacking_batch_size: int = 1 << 14
-    remask: bool = False
-    # Note that this is a TF class with lingvo-style params.
-    mlm_augmenter: py_utils.InstantiableParams = dataclasses.field(
-        default_factory=lingvo_layers.MaskedLmDataAugmenter.Params)
-    num_samples: int = -1
+  # https://github.com/mlcommons/training/tree/master/language_model/tensorflow/bert#tfrecord-features
+  input_file: Optional[Union[str, List[str]]] = None
+  max_sequence_length: int = 512
+  max_predictions_per_seq: int = 76
+  eos_token_id: int = 102
+  eval_data_size: int = 10000
+  file_buffer_size: int = 10000
+  enable_packing: bool = False
+  prepacking_batch_size: int = 1 << 14
+  remask: bool = False
+  # Note that this is a TF class with lingvo-style params.
+  mlm_augmenter: py_utils.InstantiableParams = pax_fiddle.instance_field(
+      lambda **kwargs: make_masked_ml_data_augmenter(**kwargs)  # pylint: disable=unnecessary-lambda
+  )
+  num_samples: int = -1
+  mlm: Any = dataclasses.field(init=False, repr=False)
+  _dataset: Any = dataclasses.field(init=False, repr=False)
+  _iterator: Any = dataclasses.field(init=False, repr=False)
 
-  def __init__(self, hparams: TFRecordBertInput.HParams) -> None:
-    if not hparams.is_training:
-      hparams.reset_for_eval = True
-      hparams.enable_packing = False
-      hparams.remask = False
-    if isinstance(hparams.input_file, str):
-      hparams.input_file = [hparams.input_file]
-    super().__init__(hparams)
+  def __post_init__(self):
+    if not self.is_training:
+      self.reset_for_eval = True
+      self.enable_packing = False
+      self.remask = False
+    if isinstance(self.input_file, str):
+      self.input_file = [self.input_file]
+    super().__post_init__()
 
-    if hparams.remask:
-      mlm_p = hparams.mlm_augmenter.Copy()
+    if self.remask:
+      mlm_p = self.mlm_augmenter.Copy()
       mlm_p.name = 'mlm_augmenter'
       mlm_p.dtype = tf.float32
       mlm_p.fprop_dtype = tf.float32
@@ -104,18 +114,22 @@ class TFRecordBertInput(base_input.BaseInput):
 
   def _parse_record(self, record) -> NestedMap:
     """Reads and parses a single record."""
-    p = self.hparams
     name_to_features = {
-        'input_ids':
-            tf.io.FixedLenFeature([p.max_sequence_length], tf.int64),
-        'input_mask':
-            tf.io.FixedLenFeature([p.max_sequence_length], tf.int64),
-        'masked_lm_positions':
-            tf.io.FixedLenFeature([p.max_predictions_per_seq], tf.int64),
-        'masked_lm_ids':
-            tf.io.FixedLenFeature([p.max_predictions_per_seq], tf.int64),
-        'masked_lm_weights':
-            tf.io.FixedLenFeature([p.max_predictions_per_seq], tf.float32),
+        'input_ids': tf.io.FixedLenFeature(
+            [self.max_sequence_length], tf.int64
+        ),
+        'input_mask': tf.io.FixedLenFeature(
+            [self.max_sequence_length], tf.int64
+        ),
+        'masked_lm_positions': tf.io.FixedLenFeature(
+            [self.max_predictions_per_seq], tf.int64
+        ),
+        'masked_lm_ids': tf.io.FixedLenFeature(
+            [self.max_predictions_per_seq], tf.int64
+        ),
+        'masked_lm_weights': tf.io.FixedLenFeature(
+            [self.max_predictions_per_seq], tf.float32
+        ),
     }
     example = tf.io.parse_single_example(record, name_to_features)
     mask_length = tf.cast(
@@ -137,7 +151,7 @@ class TFRecordBertInput(base_input.BaseInput):
         updates=tf.ones_like(masked_lm_ids, dtype=tf.float32))
     ret.segment_ids = tf.cast(example['input_mask'], dtype=tf.float32)
 
-    first_eos_idx = tf.where(tf.math.equal(ret.labels, p.eos_token_id))[0][0]
+    first_eos_idx = tf.where(tf.math.equal(ret.labels, self.eos_token_id))[0][0]
 
     def remove_first_eos(x):
       # We remove the element at position `first_eos_idx`, and pad with 0
@@ -147,10 +161,10 @@ class TFRecordBertInput(base_input.BaseInput):
 
     ret = ret.Transform(remove_first_eos)
     ret.paddings = 1.0 - ret.segment_ids
-    pos = tf.cast(tf.range(p.max_sequence_length), dtype=tf.float32)
+    pos = tf.cast(tf.range(self.max_sequence_length), dtype=tf.float32)
     ret.segment_pos = tf.cast(ret.segment_ids * pos, dtype=tf.int32)
 
-    if p.remask:
+    if self.remask:
       new_masked_ids, new_masked_pos = self.mlm.FProp(None, ret.labels,
                                                       ret.paddings)
       ret.masked_ids = new_masked_ids
@@ -158,8 +172,7 @@ class TFRecordBertInput(base_input.BaseInput):
     return ret
 
   def _all_paddings_batch(self) -> NestedMap:
-    p = self.hparams
-    shape = [p.batch_size, p.max_sequence_length]
+    shape = [self.batch_size, self.max_sequence_length]
     ret = py_utils.NestedMap()
     ret.labels = tf.zeros(shape, dtype=tf.int32)
     ret.masked_ids = ret.labels
@@ -170,18 +183,19 @@ class TFRecordBertInput(base_input.BaseInput):
     return ret
 
   def _pad_to_even_length(self, dataset: tf.data.Dataset) -> tf.data.Dataset:
-    p = self.hparams
-    n = p.num_infeed_hosts
+    n = self.num_infeed_hosts
     if n <= 1:
       return dataset
     # pad with all paddings batch so that the total number of elements in
     # `dataset` can be evenly divided by n.
-    if p.eval_data_size < 1:
+    if self.eval_data_size < 1:
       # dataset.cardinality() returns unknown, so we first materialize all
       # data.
       total_batches = len(list(dataset.as_numpy_iterator()))
     else:
-      total_batches = (p.eval_data_size + p.batch_size - 1) // p.batch_size
+      total_batches = (
+          self.eval_data_size + self.batch_size - 1
+      ) // self.batch_size
     if total_batches % n == 0:
       return dataset
     per_host_batches = (total_batches + n - 1) // n
@@ -196,7 +210,7 @@ class TFRecordBertInput(base_input.BaseInput):
       constant_v = 0
       if t.dtype.is_floating and key.endswith('.paddings'):
         constant_v = 1.0
-      need = self.hparams.batch_size - (t.shape[0] or tf.shape(t)[0])
+      need = self.batch_size - (t.shape[0] or tf.shape(t)[0])
       padded = tf.pad(t, [[0, need], [0, 0]], 'CONSTANT', constant_v)
       return padded
 
@@ -212,57 +226,65 @@ class TFRecordBertInput(base_input.BaseInput):
     return batch.Transform(ensure)
 
   def _gen_dataset(self) -> tf.data.Dataset:
-    p = self.hparams
     file_patterns = list(
-        map(py_utils.sharded_file_pattern_to_glob, p.input_file))
+        map(py_utils.sharded_file_pattern_to_glob, self.input_file)
+    )
     files = tf.data.Dataset.list_files(file_patterns, shuffle=False)
-    if p.is_training:
+    if self.is_training:
       # For training data, each host will only use a non-overlapping subset
       # of the training files.
       # This logic is specific to the mlperf training data, which has exactly
       # 1024 shards. Other implementations might opt to shard after reading
       # all input files, in which case one must not shuffle before sharding.
       num_files = len(list(files.as_numpy_iterator()))
-      if num_files % p.num_infeed_hosts != 0:
+      if num_files % self.num_infeed_hosts != 0:
         raise ValueError(
             'Input files sharding not supported: we require the number of files'
             f' {num_files} to evenly divide num_infeed_hosts='
-            f'{p.num_infeed_hosts} so we can shard at file level.')
+            f'{self.num_infeed_hosts} so we can shard at file level.'
+        )
       files = files.shard(
-          num_shards=p.num_infeed_hosts, index=p.infeed_host_index)
+          num_shards=self.num_infeed_hosts, index=self.infeed_host_index
+      )
       logging.info('Reading input from files: %s',
                    b', '.join(list(files.as_numpy_iterator())))
 
-    shuffle = p.is_training
+    shuffle = self.is_training
     dataset = files.interleave(
         tf.data.TFRecordDataset,
         cycle_length=tf.data.AUTOTUNE if shuffle else 1,
         num_parallel_calls=tf.data.AUTOTUNE if shuffle else 1)
     if shuffle:
-      dataset = dataset.shuffle(p.file_buffer_size, seed=p.input_random_seed)
+      dataset = dataset.shuffle(
+          self.file_buffer_size, seed=self.input_random_seed
+      )
     dataset = dataset.repeat(-1 if shuffle else 1)
     dataset = dataset.map(self._parse_record)
 
-    if p.enable_packing:
-      dataset = dataset.batch(
-          p.prepacking_batch_size,
-          drop_remainder=True,
-          num_parallel_calls=tf.data.AUTOTUNE).map(
-              self._pack,
-              num_parallel_calls=tf.data.AUTOTUNE).unbatch().shuffle(
-                  p.file_buffer_size, seed=p.input_random_seed)
+    if self.enable_packing:
+      dataset = (
+          dataset.batch(
+              self.prepacking_batch_size,
+              drop_remainder=True,
+              num_parallel_calls=tf.data.AUTOTUNE,
+          )
+          .map(self._pack, num_parallel_calls=tf.data.AUTOTUNE)
+          .unbatch()
+          .shuffle(self.file_buffer_size, seed=self.input_random_seed)
+      )
 
-    dataset = dataset.batch(batch_size=p.batch_size, drop_remainder=shuffle)
+    dataset = dataset.batch(batch_size=self.batch_size, drop_remainder=shuffle)
     if not shuffle:
       dataset = dataset.map(self._pad_to_batch_size)
 
-    if not p.is_training:
+    if not self.is_training:
       # For the eval data, each infeed host will only see a non-overlapping
       # shard of the data, since eval data is always read sequentially.
       # We need to ensure that all hosts see an equal number of batches.
       dataset = self._pad_to_even_length(dataset)
       dataset = dataset.shard(
-          num_shards=p.num_infeed_hosts, index=p.infeed_host_index)
+          num_shards=self.num_infeed_hosts, index=self.infeed_host_index
+      )
 
     dataset = dataset.map(self._ensure_shape)
     dataset = dataset.prefetch(tf.data.AUTOTUNE)
@@ -277,8 +299,9 @@ class TFRecordBertInput(base_input.BaseInput):
         actual_seq_len,
         actual_seq_len,
         packed_batch_size=0,
-        packed_src_seq_len=self.hparams.max_sequence_length,
-        packed_tgt_seq_len=self.hparams.max_sequence_length)
+        packed_src_seq_len=self.max_sequence_length,
+        packed_tgt_seq_len=self.max_sequence_length,
+    )
 
     def apply_packing(x):
       return ops.apply_packing(x, 0, segment_ids, indices_in_input)
@@ -328,30 +351,30 @@ class TextInput(base_input.BaseInput):
   raises out of range after all input data are returned at least once. Depends
   on the number of infeed hosts and batch size, duplicate input is returned
   to pad to full, synchronized batches on all infeed hosts.
+
+  Attributes:
+    input_file: String, path of a (small) input file.
+    tokenizer: Lingvo tokenizer param.
+    max_sequence_length: Maximum number of tokens to be present in a single
+      example.
+    num_samples: Number of items contained in the input. 0 for dynamically
+      determined (slower).
+    bytes_repr: Whether the texts are written as bytes representation, e.g. b'Q:
+      Who directed?\n\nA:'
   """
+  input_file: Optional[str] = None
+  tokenizer: Optional[py_utils.InstantiableParams] = None
+  max_sequence_length: int = 512
+  num_samples: int = 0
+  bytes_repr: bool = True
+  tokenizer_inst: Any = dataclasses.field(init=False, repr=False)
+  _actual_num_samples: Any = dataclasses.field(init=False, repr=False)
+  _dataset: Any = dataclasses.field(init=False, repr=False)
+  _iterator: Any = dataclasses.field(init=False, repr=False)
 
-  class HParams(base_input.BaseInput.HParams):
-    r"""Hyper-parameters for this input class.
-
-    Attributes:
-      input_file: String, path of a (small) input file.
-      tokenizer: Lingvo tokenizer param.
-      max_sequence_length: Maximum number of tokens to be present in a single
-        example.
-      num_samples: Number of items contained in the input. 0 for dynamically
-        determined (slower).
-      bytes_repr: Whether the texts are written as bytes representation, e.g.
-        b'Q: Who directed?\n\nA:'
-    """
-    input_file: Optional[str] = None
-    tokenizer: Optional[py_utils.InstantiableParams] = None
-    max_sequence_length: int = 512
-    num_samples: int = 0
-    bytes_repr: bool = True
-
-  def __init__(self, hparams: TextInput.HParams) -> None:
-    super().__init__(hparams)
-    self.tokenizer = hparams.tokenizer.Instantiate()
+  def __post_init__(self):
+    super().__post_init__()
+    self.tokenizer_inst = self.tokenizer.Instantiate()
     self._actual_num_samples = None
     self._dataset = self._gen_dataset()
     self._iterator = iter(self._dataset)
@@ -365,43 +388,43 @@ class TextInput(base_input.BaseInput):
     self._iterator = iter(self._dataset)
 
   @property
-  def num_samples(self):
+  def computed_num_samples(self):
     """Number of samples contained in the dataset."""
-    p = self.hparams
     if self._actual_num_samples is not None:
       return self._actual_num_samples
-    if p.num_samples > 0:
-      self._actual_num_samples = p.num_samples
+    if self.num_samples > 0:
+      self._actual_num_samples = self.num_samples
     else:
-      lines = tf.data.TextLineDataset(p.input_file)
+      lines = tf.data.TextLineDataset(self.input_file)
       self._actual_num_samples = len(list(lines.as_numpy_iterator()))
     return self._actual_num_samples
 
   def _num_to_truncate(self):
     """Smallest multiple of global batch size that covers the entire data."""
-    p = self.hparams
-    n = p.num_infeed_hosts * p.batch_size
-    num_global_batches = (self.num_samples + n - 1) // n
+    n = self.num_infeed_hosts * self.batch_size
+    num_global_batches = (self.computed_num_samples + n - 1) // n
     return num_global_batches * n
 
   def ids_to_strings(self, ids: pytypes.NpTensor,
                      lengths: pytypes.NpTensor) -> List[str]:
-    bytes_list = self.tokenizer.IdsToStrings(ids, lengths).numpy()
+    bytes_list = self.tokenizer_inst.IdsToStrings(ids, lengths).numpy()
     return [b.decode('utf-8') for b in bytes_list]
 
   def _to_nested_map(self, text) -> py_utils.NestedMap:
-    ids, labels, paddings = self.tokenizer.StringsToIds(
-        text, max_length=self.hparams.max_sequence_length)
+    ids, labels, paddings = self.tokenizer_inst.StringsToIds(
+        text, max_length=self.max_sequence_length
+    )
     # Unfortunately some tokenizers don't return the correct paddings.
     # We recompute it by looking at when the labels sequence terminates.
-    indices = tf.where(tf.math.equal(labels, self.tokenizer.eos_id))
+    indices = tf.where(tf.math.equal(labels, self.tokenizer_inst.eos_id))
     lengths = tf.math.segment_min(indices[:, 1], indices[:, 0]) + 1
     new_paddings = tf.cast(
-        1.0 - tf.sequence_mask(
-            lengths,
-            maxlen=self.hparams.max_sequence_length,
-            dtype=paddings.dtype),
-        dtype=paddings.dtype)
+        1.0
+        - tf.sequence_mask(
+            lengths, maxlen=self.max_sequence_length, dtype=paddings.dtype
+        ),
+        dtype=paddings.dtype,
+    )
     weights = 1. - new_paddings
     return py_utils.NestedMap(
         ids=ids, labels=labels, paddings=new_paddings, weights=weights)
@@ -420,13 +443,13 @@ class TextInput(base_input.BaseInput):
     return ds.map(tf_eval_bytes)
 
   def _gen_dataset(self) -> tf.data.Dataset:
-    p = self.hparams
-    lines = tf.data.TextLineDataset(p.input_file)
-    if p.bytes_repr:
+    lines = tf.data.TextLineDataset(self.input_file)
+    if self.bytes_repr:
       lines = self._remove_bytes_repr(lines)
-    num_repeat = self._num_to_truncate() // self.num_samples + 1
+    num_repeat = self._num_to_truncate() // self.computed_num_samples + 1
     lines = lines.repeat(num_repeat).take(self._num_to_truncate())
     lines = lines.shard(
-        num_shards=p.num_infeed_hosts, index=p.infeed_host_index)
-    lines = lines.batch(p.batch_size)
+        num_shards=self.num_infeed_hosts, index=self.infeed_host_index
+    )
+    lines = lines.batch(self.batch_size)
     return lines.map(self._to_nested_map)

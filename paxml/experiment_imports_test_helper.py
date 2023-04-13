@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 Google LLC.
+# Copyright 2022 The Pax Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -54,7 +54,9 @@ class ExperimentImportsTestHelper(absltest.TestCase):
     # Registered experiment configurations must have at least a dataset split.
     self.assertNotEmpty(dataset_splits)
     for s in dataset_splits:
-      self.assertIsInstance(s, base_input.BaseInput.HParams)
+      self.assertIsInstance(
+          s, (base_input.BaseInput.HParams, base_input.DistributedInputHParams)
+      )
 
     # Note: Creating the input generator may require data access. Only do it
     # for explicitly allowed experiments for now.

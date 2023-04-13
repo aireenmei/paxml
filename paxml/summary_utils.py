@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 Google LLC.
+# Copyright 2022 The Pax Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -47,8 +47,11 @@ FLAGS = flags.FLAGS
 
 
 JTensor = pytypes.JTensor
+Nested = pytypes.Nested
 NestedJTensor = pytypes.NestedJTensor
 TrainState = train_states.TrainState
+TensorProvenance = train_states.TensorProvenance
+TrainStateProvenance = train_states.TrainStateProvenance
 SummaryType = base_layer.SummaryType
 SummaryWriter = tf.summary.SummaryWriter
 WeightedScalars = pytypes.WeightedScalars
@@ -91,6 +94,12 @@ def pretty_repr(values: NestedJTensor, num_spaces: int = 4) -> str:
     return repr(values)
 
 
+def pretty_format_iters(input_str: str) -> str:
+  for c in '{}(),[]':
+    input_str = input_str.replace(c, '')
+  return '\n'.join(l for l in input_str.splitlines() if (l and not l.isspace()))
+
+
 def pretty_repr_shapes(replicated_vars: NestedJTensor,
                        is_vars_replicated) -> str:
   """Returns a pretty representation of the variable shapes."""
@@ -101,15 +110,20 @@ def pretty_repr_shapes(replicated_vars: NestedJTensor,
       return 'x'.join(str(e) for e in x.shape[1:])
     else:
       # If var is not replicated, no need to remove the first dim.
-      # Retrieves the global shape for GDA; otherwise host-local shape.
+      # Retrieves the global shape for Jax array; otherwise host-local shape.
       x_sda = x
       return 'x'.join(str(e) for e in x_sda.shape)
 
   out = jax.tree_map(pps, replicated_vars)
   out = pretty_repr(out)
-  for c in '{}(),[]':
-    out = out.replace(c, '')
-  return '\n'.join(l for l in out.splitlines() if (l and not l.isspace()))
+  return pretty_format_iters(out)
+
+
+def pretty_repr_provenance(
+    provenance: Union[TensorProvenance, Nested[TensorProvenance]]
+) -> str:
+  provenance_out = pretty_repr(provenance)
+  return pretty_format_iters(provenance_out)
 
 
 def _yield_subtrees(
@@ -215,7 +229,7 @@ def aggregate_per_replica_summaries(summary_tensors: NestedJTensor):
   image_summaries = {}
   audio_summaries = {}
   video_summaries = {}
-  for k, v in summary_tensors.items():
+  for k, v in summary_tensors.items():  # pytype: disable=attribute-error  # jax-ndarray
     summary_type = base_layer.get_summary_type_from_key(k)
     if base_layer.get_summary_base_type(summary_type) == SummaryType.SCALAR:
       scalar_summaries[k] = v
@@ -248,7 +262,7 @@ def aggregate_per_replica_summaries(summary_tensors: NestedJTensor):
       lambda x: jax.lax.all_gather(x, axis_name=PMAP_PARALLEL_AXIS_NAME),
       video_summaries)
 
-  summary_tensors = summary_tensors.copy()
+  summary_tensors = summary_tensors.copy()  # pytype: disable=attribute-error  # jax-ndarray
   for summary_dict in (
       scalar_summaries,
       image_summaries,
@@ -302,11 +316,12 @@ def write_summary_tensor(
     tensor: Union[float, JTensor, str, Sequence[JTensor]],
     summary_type: SummaryType,
     metadata: Optional[Any] = None,
+    sample_rate: int = AUDIO_SUMMARY_SAMPLE_RATE,
 ) -> bool:
   """Writes summary in relevant processes."""
   if FLAGS.pax_only_aggregate_summaries:
-    if summary_type in {
-        SummaryType.SCALAR, SummaryType.IMAGE, SummaryType.AUDIO
+    if summary_type not in {
+        SummaryType.AGGREGATE_SCALAR, SummaryType.AGGREGATE_IMAGE
     }:
       return
   if isinstance(tensor, (list, tuple)):
@@ -317,13 +332,14 @@ def write_summary_tensor(
   # Tensors are often pushed in step ascending order. Iterate over the most
   # recent ones. Only useful for non-aggregated summaries.
   tensors_it = reversed(tensors)
-  if base_layer.get_summary_base_type(summary_type) == SummaryType.SCALAR:
+  base_summary_type = base_layer.get_summary_base_type(summary_type)
+  if base_summary_type == SummaryType.SCALAR:
     # Force DeviceArray to NumPy array conversion before taking the mean.
     np_tensors = [np.array(t) for t in tensors_it]
-    logging.info('summary tensor at step=%s %s %s', step_i, key, np_tensors)
     tensor = np.mean(np_tensors).item()
+    logging.info('summary tensor at step=%s %s %s', step_i, key, tensor)
     tf_summary.scalar(key, tensor, step_i)
-  elif base_layer.get_summary_base_type(summary_type) == SummaryType.IMAGE:
+  elif base_summary_type == SummaryType.IMAGE:
     remaining_max_images = MAX_IMAGES_PER_SUMMARY
     for tensor in tensors_it:
       if remaining_max_images <= 0:
@@ -334,7 +350,7 @@ def write_summary_tensor(
       for i in range(min(tensor.shape[0], remaining_max_images)):
         tf_summary.image(f'{key}/{i}', tensor[i:i + 1], step_i)
       remaining_max_images -= tensor.shape[0]
-  elif base_layer.get_summary_base_type(summary_type) == SummaryType.AUDIO:
+  elif base_summary_type == SummaryType.AUDIO:
     remaining_max_audios = MAX_AUDIOS_PER_SUMMARY
     for tensor in tensors_it:
       if remaining_max_audios <= 0:
@@ -342,10 +358,9 @@ def write_summary_tensor(
       tensor = np.reshape(tensor, [-1] + list(tensor.shape[-2:]))
       # TODO(nanxinchen): Make the sampling rate configurable
       for i in range(min(tensor.shape[0], remaining_max_audios)):
-        tf_summary.audio(f'{key}/{i}', tensor[i:i + 1],
-                         AUDIO_SUMMARY_SAMPLE_RATE, step_i)
+        tf_summary.audio(f'{key}/{i}', tensor[i : i + 1], sample_rate, step_i)
       remaining_max_audios -= tensor.shape[0]
-  elif base_layer.get_summary_base_type(summary_type) == SummaryType.TEXT:
+  elif base_summary_type == SummaryType.TEXT:
     remaining_max_texts = MAX_TEXTS_PER_SUMMARY
     for tensor in tensors_it:
       if remaining_max_texts <= 0:
@@ -362,6 +377,10 @@ def write_summary_tensor(
     # Ensure that only one video summary is passed at a time.
     assert len(tensors) == 1
     tf_summary.write(tag=key, tensor=tensors[0], metadata=metadata, step=step_i)
+  elif base_summary_type == SummaryType.HISTOGRAM:
+    # Similar to the scalar case, we merge the histogram values. We expect the
+    # same number of elements per tensor in `tensors`.
+    tf_summary.histogram(key, np.concatenate(tensors), step_i)
   else:
     assert False, 'Unsupported summary type: ' + str(summary_type)
 
@@ -375,7 +394,7 @@ def write_summary_entry(summary_writer: SummaryWriter,
   """Writes a summary entry into the provided SummaryWriter."""
   work_unit = platform.work_unit()
   # Scalar values must be plain Python types rather than e.g. np.int / np.float.
-  # SPMD training may produce GDA.
+  # SPMD training will produce a Jax Array.
   loss = py_utils.maybe_unreplicate_for_fully_replicated(loss)
   weighted_scalars_list = py_utils.maybe_unreplicate_for_fully_replicated(
       weighted_scalars_list)
@@ -424,17 +443,44 @@ def write_summary_entry(summary_writer: SummaryWriter,
                mean_loss)
 
 
-def write_model_structure(train_summary_writer: SummaryWriter,
-                          train_state: TrainState, is_vars_replicated):
+def write_model_structure(
+    train_summary_writer: SummaryWriter,
+    train_state: TrainState,
+    is_vars_replicated,
+):
   """Writes the Model Param structure to TB."""
   with train_summary_writer.as_default():
     out = pretty_repr_shapes(train_state.mdl_vars, is_vars_replicated)
-    tf_summary.text('Model', out, step=0)
+    tf_summary.text(
+        'Model', out, step=0
+    )
   train_summary_writer.flush()
 
 
-def write_total_num_params(train_summary_writer: SummaryWriter,
-                           total_num_params: int):
+def write_model_provenance(
+    train_summary_writer: SummaryWriter,
+    train_state_provenance: TrainStateProvenance,
+):
+  """Writes the TrainStateProvenance to TB."""
+  with train_summary_writer.as_default():
+    mdl_vars_out = pretty_repr_provenance(train_state_provenance.mdl_vars)
+    tf_summary.text(
+        'Model vars provenance',
+        mdl_vars_out,
+        step=0,
+    )
+    opt_states_out = pretty_repr_provenance(train_state_provenance.opt_states)
+    tf_summary.text(
+        'Opt states provenance',
+        opt_states_out,
+        step=0,
+    )
+  train_summary_writer.flush()
+
+
+def write_total_num_params(
+    train_summary_writer: SummaryWriter, total_num_params: int
+):
   """Writes the total number of parameters to TB."""
   with train_summary_writer.as_default():
     # Add whitespace every 3 digit for readability.

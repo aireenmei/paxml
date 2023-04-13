@@ -61,20 +61,17 @@ RUN git clone https://github.com/google/praxis.git && \
 
 RUN cp -r praxis/praxis /paxml/
 
-RUN cd /paxml/praxis/pip_package && \
+RUN cd /praxis && \
     pip-compile --quiet requirements.in \
     --output-file $WHEEL_FOLDER/praxis_requirements.txt
 
-RUN cd /paxml/paxml/pip_package && \
+RUN cd /paxml && \
     sed -i 's/praxis/#praxis/' requirements.in && \
     pip-compile --quiet requirements.in \
-    /paxml/praxis/pip_package/requirements.in \
+    /praxis/requirements.in \
     --output-file $WHEEL_FOLDER/paxml_requirements.txt
 
-RUN pip3 install -r paxml/paxml/pip_package/requirements.txt
-
-RUN git clone https://github.com/google/flaxformer.git
-RUN cd flaxformer && pip3 install .
+RUN pip3 install --no-deps -r paxml/paxml/pip_package/requirements.txt
 
 RUN mv paxml/paxml/pip_package /paxml/
 RUN cd /paxml && bash pip_package/build.sh
@@ -89,7 +86,6 @@ RUN cd praxis && \
   -praxis/layers:convolutions_test \
   -praxis/layers:ctc_objectives_test \
   -praxis/layers:embedding_softmax_test \
-  -praxis/layers:flaxformer_models_test \
   -praxis/layers:models_test \
   -praxis/layers:ngrammer_test \
   -praxis/layers:normalizations_test \

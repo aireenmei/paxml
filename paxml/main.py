@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 Google LLC.
+# Copyright 2022 The Pax Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -39,7 +39,6 @@ import fiddle as fdl
 from fiddle import absl_flags
 import jax
 from paxml import base_experiment
-from paxml import checkpoints
 from paxml import eval_lib
 from paxml import experiment_registry
 from paxml import setup_jax
@@ -52,7 +51,6 @@ from praxis import py_utils
 import pyglove as pg
 
 # internal experiment module import
-AsyncPersistenceCheckpointer = checkpoints.AsyncCheckpointer  # mapped to internal
 
 FLAGS = flags.FLAGS
 
@@ -92,6 +90,11 @@ flags.DEFINE_bool(
     'Enables fully asynchronous checkpointing via GDA and TensorStore. This '
     'means that the training can continue ahead when checkpointing is '
     'happening.')
+flags.DEFINE_bool(
+    'tensorstore_use_ocdbt',
+    False,
+    'If True, uses OCDBT format when saving with Tensorstore.',
+)
 flags.DEFINE_string(
     'jax_traceback_filtering_option', 'auto',
     'Controls how JAX filters internal frames out of tracebacks: '
@@ -111,23 +114,32 @@ epath.DEFINE_path(
     'restore_checkpoint_dir', None,
     'If set, the directory from which to restore checkpoint. Only supported '
     'for --mode=decode_once and --mode=decode.')
-flags.DEFINE_integer(
+flags.DEFINE_multi_integer(
     'restore_checkpoint_step', None,
-    'If set, the checkpoint step to restore. Only supported when '
-    '--mode=decode_once.')
+    ('If set, the checkpoint step to restore. Only supported when '
+     '--mode=decode_once.'))
 flags.DEFINE_bool(
     'globally_use_hardware_rng', True,
     'Whether to globally use fast hardware RNG. Deterministic only at the '
     'same compiler version and with the same sharding')
 flags.DEFINE_integer(
     'jax_profiler_port', None,
-    'If set, the jax.profiler port to use. Only needed for profiling in open source.'
+    ('If set, the jax.profiler port to use. Only needed for profiling in open'
+     ' source.')
 )
 flags.DEFINE_bool('enable_auto_sharding', False,
                   'Enable the XLA Auto SPMD partitioner.')
 flags.DEFINE_bool(
     'enable_checkpoint_saving', True,
     'Enable checkpoint saving. Useful to disable for test- or debug-like runs.')
+flags.DEFINE_bool(
+    'enforce_restore_shape_check',
+    False,
+    (
+        'If True, raise an error when the requested restore shape of an array'
+        ' does not match the shape in the checkpoint.'
+    ),
+)
 # Flags for automatic tuning.
 flags.DEFINE_string(
     'study', None,
@@ -159,9 +171,28 @@ flags.DEFINE_integer(
     'pythia_port', None,
     'Port for hosting Pythia service when non-Vizier built-in algorithms '
     'is used')
+flags.DEFINE_string(
+    'should_log_compiles', None,
+    'Whether to log compile time')
+flags.DEFINE_string(
+    'tfds_data_dir', None,
+    'If set, directory used to store datasets prepared by '
+    'TensorFlow Datasets that are not available in the public TFDS GCS '
+    'bucket.')
 
-# Flags --jax_parallel_functions_output_gda, --jax_backend_target,
-# --jax_xla_backend, --jax_enable_checks are available through JAX.
+## multiprocessing GPU flags
+flags.DEFINE_bool(
+    'multiprocess_gpu', False, 
+    'Whether to initialize JAX distributed for multi-host GPU')
+flags.DEFINE_string(
+    'server_addr', None, help='server ip addr')
+flags.DEFINE_integer(
+    'num_hosts', None, help='num of hosts' )
+flags.DEFINE_integer(
+    'host_idx', None, help='index of current host' )
+
+# Flags --jax_backend_target, --jax_xla_backend, --jax_enable_checks are
+# available through JAX.
 
 
 def get_experiment(experiment_name: str) -> base_experiment.BaseExperimentT:
@@ -218,30 +249,20 @@ def run_experiment(
   if FLAGS.mode == 'train':
     work_unit.set_task_status(f'Train experiment {FLAGS.exp} at'
                               f' {job_log_dir}')
-    async_checkpointer = None
-    if FLAGS.jax_fully_async_checkpoint:
-      if FLAGS.maybe_use_persistence_checkpointing:
-        async_checkpointer = AsyncPersistenceCheckpointer(timeout_secs=600)
-      else:
-        async_checkpointer = checkpoints.AsyncCheckpointer(
-            checkpoints.PaxCheckpointHandler(),
-            timeout_secs=600)
-
     train.train_and_evaluate(
         experiment_config=experiment_config,
         job_log_dir=job_log_dir,
-        maybe_use_persistence_checkpointing=FLAGS
-        .maybe_use_persistence_checkpointing,
+        maybe_use_persistence_checkpointing=FLAGS.maybe_use_persistence_checkpointing,
         eval_on_test=FLAGS.eval_on_test,
         checkpoint_todelete_subdir=FLAGS.checkpoint_todelete_subdir,
         early_stopping_fn=early_stopping_fn,
         run_decode=FLAGS.decode_during_train,
         enable_auto_sharding=FLAGS.enable_auto_sharding,
-        async_checkpointer=async_checkpointer,
-        enable_checkpoint_saving=enable_checkpoint_saving)
-
-    if async_checkpointer is not None:
-      async_checkpointer.wait_until_finished()
+        enable_async_checkpointing=FLAGS.jax_fully_async_checkpoint,
+        enable_checkpoint_saving=enable_checkpoint_saving,
+        enforce_restore_shape_check=FLAGS.enforce_restore_shape_check,
+        tensorstore_use_ocdbt=FLAGS.tensorstore_use_ocdbt,
+    )
 
   elif FLAGS.mode == 'eval':
     work_unit.set_task_status(f'Eval experiment {FLAGS.exp} at'
@@ -249,45 +270,60 @@ def run_experiment(
     eval_lib.evaluate(
         experiment_config=experiment_config,
         job_log_dir=job_log_dir,
-        maybe_use_persistence_checkpointing=FLAGS
-        .maybe_use_persistence_checkpointing,
+        maybe_use_persistence_checkpointing=FLAGS.maybe_use_persistence_checkpointing,
         early_stopping_fn=early_stopping_fn,
-        enable_auto_sharding=FLAGS.enable_auto_sharding)
+        enable_auto_sharding=FLAGS.enable_auto_sharding,
+        enforce_restore_shape_check=FLAGS.enforce_restore_shape_check,
+        tensorstore_use_ocdbt=FLAGS.tensorstore_use_ocdbt,
+    )
   elif FLAGS.mode == 'decode':
     work_unit.set_task_status(f'Decode experiment {FLAGS.exp} at'
                               f' {job_log_dir}')
     eval_lib.decode(
         experiment_config=experiment_config,
         job_log_dir=job_log_dir,
-        maybe_use_persistence_checkpointing=FLAGS
-        .maybe_use_persistence_checkpointing,
+        maybe_use_persistence_checkpointing=FLAGS.maybe_use_persistence_checkpointing,
         restore_checkpoint_dir=FLAGS.restore_checkpoint_dir,
         restore_checkpoint_step=None,
         continuous_decode=True,
         run_eval=FLAGS.eval_during_decode,
         early_stopping_fn=early_stopping_fn,
         enable_checkpoint_saving=enable_checkpoint_saving,
-        enable_auto_sharding=FLAGS.enable_auto_sharding)
-  elif FLAGS.mode == 'decode_once':
-    work_unit.set_task_status(f'Decode-once experiment {FLAGS.exp} at'
-                              f' {job_log_dir}')
-    eval_lib.decode(
-        experiment_config=experiment_config,
-        job_log_dir=job_log_dir,
-        maybe_use_persistence_checkpointing=FLAGS
-        .maybe_use_persistence_checkpointing,
-        restore_checkpoint_dir=FLAGS.restore_checkpoint_dir,
-        restore_checkpoint_step=FLAGS.restore_checkpoint_step,
-        continuous_decode=False,
-        run_eval=FLAGS.eval_during_decode,
-        early_stopping_fn=early_stopping_fn,
         enable_auto_sharding=FLAGS.enable_auto_sharding,
-        output_pickle=FLAGS.decode_output_pickle,
-        )
+        enforce_restore_shape_check=FLAGS.enforce_restore_shape_check,
+        tensorstore_use_ocdbt=FLAGS.tensorstore_use_ocdbt,
+    )
+  elif FLAGS.mode == 'decode_once':
+    if (restore_checkpoint_steps := FLAGS.restore_checkpoint_step) is None:
+      restore_checkpoint_steps = [None]
+
+    for restore_step in restore_checkpoint_steps:
+      work_unit.set_task_status(f'Decode-once experiment {FLAGS.exp} at'
+                                f' {job_log_dir} for step={restore_step}')
+      restore_step = int(restore_step) if restore_step is not None else None
+      logging.info('Decode-once on step: %s', restore_step)
+      eval_lib.decode(
+          experiment_config=experiment_config,
+          job_log_dir=job_log_dir,
+          maybe_use_persistence_checkpointing=FLAGS.maybe_use_persistence_checkpointing,
+          restore_checkpoint_dir=FLAGS.restore_checkpoint_dir,
+          restore_checkpoint_step=restore_step,
+          continuous_decode=False,
+          run_eval=FLAGS.eval_during_decode,
+          early_stopping_fn=early_stopping_fn,
+          enable_auto_sharding=FLAGS.enable_auto_sharding,
+          output_pickle=FLAGS.decode_output_pickle,
+          enforce_restore_shape_check=FLAGS.enforce_restore_shape_check,
+          tensorstore_use_ocdbt=FLAGS.tensorstore_use_ocdbt,
+      )
   elif FLAGS.mode == 'infer':
     work_unit.set_task_status(f'infer experiment {FLAGS.exp} at {job_log_dir}')
     eval_lib.infer_and_write(
-        experiment_config=experiment_config, job_log_dir=job_log_dir)
+        experiment_config=experiment_config,
+        job_log_dir=job_log_dir,
+        enforce_restore_shape_check=FLAGS.enforce_restore_shape_check,
+        tensorstore_use_ocdbt=FLAGS.tensorstore_use_ocdbt,
+    )
 
   # Wait for all processes to exit at the same time because if some tasks
   # finish early and exited, when a preemption event comes, only a
@@ -317,8 +353,9 @@ def run(experiment_config: base_experiment.BaseExperiment,
   work_unit = platform.work_unit()
   work_unit.set_task_status(f'process_index: {jax.process_index()}, '
                             f'process_count: {jax.process_count()}')
-  work_unit.create_artifact(platform.ArtifactType.DIRECTORY,
-                            str(FLAGS.job_log_dir), 'job_log_dir')
+  if jax.process_index() == 0:
+    work_unit.create_artifact(platform.ArtifactType.DIRECTORY,
+                              str(FLAGS.job_log_dir), 'job_log_dir')
 
   # Start jax.profiler for TensorBoard and profiling in open source.
   if FLAGS.jax_profiler_port is not None:
@@ -359,13 +396,26 @@ def run(experiment_config: base_experiment.BaseExperiment,
 
 
 def main(argv: Sequence[str]) -> None:
+  start = time.time()
   if len(argv) > 1:
     raise app.UsageError('Too many command-line arguments.')
 
+  if FLAGS.tfds_data_dir is not None:
+    # seqio import is slow so avoid module-level import
+    import seqio
+    seqio.set_tfds_data_dir_override(FLAGS.tfds_data_dir)
+
+  should_initialize_jax_distributed = (
+      FLAGS.jax_fully_async_checkpoint or FLAGS.multiprocess_gpu)
   setup_jax.setup_jax(FLAGS.globally_use_hardware_rng, FLAGS.jax_backend_target,
                       FLAGS.jax_xla_backend, FLAGS.jax_enable_checks,
                       FLAGS.jax_traceback_filtering_option,
-                      FLAGS.jax_fully_async_checkpoint)
+                      should_initialize_jax_distributed,
+                      FLAGS.should_log_compiles,
+                      setup_jax.JaxDistributedOptions(FLAGS.server_addr,
+                                                      FLAGS.num_hosts,
+                                                      FLAGS.host_idx)
+                     )
 
   if FLAGS.exp is not None:
     experiment_config = get_experiment(FLAGS.exp)()
@@ -378,6 +428,9 @@ def main(argv: Sequence[str]) -> None:
   run(experiment_config=experiment_config,
       enable_checkpoint_saving=FLAGS.enable_checkpoint_saving)
 
+  e2e_time = time.time() - start
+  logging.info(f'E2E time: {e2e_time}')
+
 
 _TASK_HANDLE_RE = re.compile(r'(?:logs\.)?(\d+)\.(.*)\.([^.]+)\.\d+')
 
@@ -385,7 +438,7 @@ if __name__ == '__main__':
   # Only dump from Borg task 0.
   if 'BORG_TASK_HANDLE' in os.environ:
     handle = os.getenv('BORG_TASK_HANDLE')
-    task_id, _, _ = _TASK_HANDLE_RE.match(handle).groups()
+    task_id, _, _ = _TASK_HANDLE_RE.match(handle).groups()  # pytype: disable=attribute-error  # re-none
     if int(task_id) == 0:
       dump_dir = os.getenv('XLA_DUMP_TO')
       if dump_dir:

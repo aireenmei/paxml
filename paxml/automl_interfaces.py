@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 Google LLC.
+# Copyright 2022 The Pax Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -29,7 +29,9 @@ BaseParameterizable = base_hyperparams.BaseParameterizable
 MetricAggregationFn = Callable[[Sequence[float]], float]
 
 
-class BaseAlgorithm(BaseParameterizable, metaclass=abc.ABCMeta):
+class BaseAlgorithm(
+    base_hyperparams.FiddleBaseParameterizable, metaclass=abc.ABCMeta
+):
   """Base class for search algorithms."""
 
   @abc.abstractmethod
@@ -37,7 +39,9 @@ class BaseAlgorithm(BaseParameterizable, metaclass=abc.ABCMeta):
     """Returns a PyGlove DNAGenerator."""
 
 
-class BaseEarlyStoppingPolicy(BaseParameterizable, metaclass=abc.ABCMeta):
+class BaseEarlyStoppingPolicy(
+    base_hyperparams.FiddleBaseParameterizable, metaclass=abc.ABCMeta
+):
   """Base class for population-wise early stopping policy."""
 
   @abc.abstractmethod
@@ -45,7 +49,9 @@ class BaseEarlyStoppingPolicy(BaseParameterizable, metaclass=abc.ABCMeta):
     """Returns a PyGlove early stopping policy."""
 
 
-class BaseReward(BaseParameterizable, metaclass=abc.ABCMeta):
+class BaseReward(
+    base_hyperparams.FiddleBaseParameterizable, metaclass=abc.ABCMeta
+):
   """Base class for reward functions."""
 
   @abc.abstractmethod
@@ -73,7 +79,9 @@ class BaseReward(BaseParameterizable, metaclass=abc.ABCMeta):
     return any(m.is_decode_metric for m in self.used_metrics)
 
 
-class CrossStepMetricAggregator(BaseParameterizable, metaclass=abc.ABCMeta):
+class CrossStepMetricAggregator(
+    base_hyperparams.FiddleBaseParameterizable, metaclass=abc.ABCMeta
+):
   """Aggregator for gathering metrics across multiple steps."""
 
   @abc.abstractmethod
@@ -126,6 +134,9 @@ class SearchHParams(BaseHyperParams):
       config will be added to trial metadata for helping meta-learning later.
       If the study will be very large and users don't want to store the
       experiment config, set it to False.
+    treats_early_stopped_trials_as_done: If True, early stopped trials will
+      be treated as done, whose rewards will be fed back to the controller,
+      except for those trials who haven't added any measurements.
   """
   search_algorithm: Optional[BaseAlgorithm.HParams] = None
   search_reward: Optional[BaseReward.HParams] = None
@@ -138,6 +149,7 @@ class SearchHParams(BaseHyperParams):
   prior_study_ids: Optional[List[int]] = None
   add_prior_trials: bool = False
   add_experiment_config_to_metadata: bool = True
+  treats_early_stopped_trials_as_done: bool = False
 
 
 class MetricType(enum.Enum):

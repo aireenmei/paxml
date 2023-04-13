@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 Google LLC.
+# Copyright 2022 The Pax Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,12 +17,16 @@
 
 import abc
 import collections
+import dataclasses
 import inspect
 import math
+import typing
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type, Union
+
 from paxml import automl_interfaces
 # Placeholder for importing Google-internal tuning modules.
 from praxis import base_hyperparams
+from praxis import pax_fiddle
 import pyglove as pg
 
 
@@ -107,7 +111,8 @@ def hyperparameter_tuning(
       early_stopping=early_stopping,
       max_num_trials=max_num_trials,
       errors_to_skip=errors_to_skip,
-      cross_step_metric_aggregator=cross_step_metric_aggregator)
+      cross_step_metric_aggregator=cross_step_metric_aggregator,
+      treats_early_stopped_trials_as_done=True)
 
 
 def neural_architecture_search(
@@ -171,18 +176,14 @@ class RandomSearch(BaseAlgorithm):
 
   Comparing to the VizierBuiltin('RANDOM_SEARCH'), PyGlove's random search
   supports `pg.manyof` with constraints.
+
+  Attributes:
+    seed: Seed of the Random search.
   """
-
-  class HParams(BaseAlgorithm.HParams):
-    """Hyperparameters for RandomSearch.
-
-    Attributes:
-      seed: Seed of the Random search.
-    """
-    seed: Optional[int] = None
+  seed: Optional[int] = None
 
   def __call__(self):
-    return pg.geno.Random(seed=self._hparams.seed)
+    return pg.geno.Random(seed=self.seed)
 
 
 class Sweeping(BaseAlgorithm):
@@ -202,28 +203,25 @@ class RegularizedEvolution(BaseAlgorithm):
 
   Reference:
   https://arxiv.org/abs/1802.01548.
+
+  Attributes:
+    mutator: Mutator to use.
+    population_size: Population size.
+    tournament_size: Tournament size.
+    seed: Random seed.
   """
-
-  class HParams(BaseAlgorithm.HParams):
-    """Hyperparameters for PPO.
-
-    Attributes:
-      mutator: Mutator to use.
-      population_size: Population size.
-      tournament_size: Tournament size.
-      seed: Random seed.
-    """
-    mutator: pg.evolution.Mutator = pg.evolution.mutators.Uniform()  # pytype: disable=annotation-type-mismatch
-    population_size: int = 100
-    tournament_size: int = 10
-    seed: Optional[int] = None
+  mutator: pg.evolution.Mutator = pg.evolution.mutators.Uniform()  # pytype: disable=annotation-type-mismatch
+  population_size: int = 100
+  tournament_size: int = 10
+  seed: Optional[int] = None
 
   def __call__(self):
     return pg.evolution.regularized_evolution(
-        self._hparams.mutator,
-        population_size=self._hparams.population_size,
-        tournament_size=self._hparams.tournament_size,
-        seed=self._hparams.seed)
+        self.mutator,
+        population_size=self.population_size,
+        tournament_size=self.tournament_size,
+        seed=self.seed,
+    )
 
 
 #
@@ -232,141 +230,137 @@ class RegularizedEvolution(BaseAlgorithm):
 
 
 class SingleObjective(BaseReward):
-  """Single objective reward."""
+  """Single objective reward.
 
-  class HParams(BaseReward.HParams):
-    """Hyperparameters for SingleObjective.
+  Attributes:
+    metric: The key of metric whose value will be used as reward.
+    goal: Defines how the metric should be optimized. Acceptable values are
+      'maximize' or 'minimize'.
+    reward_for_nan: An optional float used as the reward when metric value is
+      NaN. If not specified, the reward will remain NaN so the trial will be
+      skipped by the search algorithm.
+  """
+  metric: Optional[Metric] = None
+  goal: str = 'maximize'
+  reward_for_nan: Optional[float] = None
 
-    Attributes:
-      metric: The key of metric whose value will be used as reward.
-      goal: Defines how the metric should be optimized. Acceptable values are
-        'maximize' or 'minimize'.
-      reward_for_nan: An optional float used as the reward when metric value is
-        NaN. If not specified, the reward will remain NaN so the trial will be
-        skipped by the search algorithm.
-    """
-    metric: Optional[Metric] = None
-    goal: str = 'maximize'
-    reward_for_nan: Optional[float] = None
-
-    def __post_init__(self):
-      super().__post_init__()
-      if self.metric is None:
-        raise ValueError('Param `metric` should not be None.')
-      if self.goal not in ['maximize', 'minimize']:
-        raise ValueError(
-            'Param `goal` should be either \'maximize\' or \'minimize\'.')
+  def __post_init__(self):
+    super().__post_init__()
+    if self.metric is None:
+      raise ValueError('Param `metric` should not be None.')
+    if self.goal not in ['maximize', 'minimize']:
+      raise ValueError(
+          "Param `goal` should be either 'maximize' or 'minimize'."
+      )
 
   def __call__(self, metrics_dict: Dict[str, float], global_step: int) -> float:
     del global_step
-    reward = self._hparams.metric.get_value(metrics_dict)
+    assert self.metric is not None
+    reward = self.metric.get_value(metrics_dict)
 
-    if self._hparams.goal == 'minimize':
+    if self.goal == 'minimize':
       reward *= -1
-    if self._hparams.reward_for_nan is not None and math.isnan(reward):
-      reward = self._hparams.reward_for_nan
+    if self.reward_for_nan is not None and math.isnan(reward):
+      reward = self.reward_for_nan
     return reward
 
   @property
   def used_metrics(self) -> Sequence[Metric]:
-    assert self._hparams.metric is not None
-    return [self._hparams.metric]
+    assert self.metric is not None
+    return [self.metric]
 
 
-class MultiObjectiveAggregator(BaseParameterizable, metaclass=abc.ABCMeta):
+class MultiObjectiveAggregator(
+    base_hyperparams.FiddleBaseParameterizable, metaclass=abc.ABCMeta
+):
   """Base class for multi objective aggregators."""
 
-  class HParams(InstantiableHyperParams):
-    """Hyperparameters for MultiObjectiveAggregator."""
-
   @abc.abstractmethod
-  def __call__(self, values: Sequence[float]) -> float:
+  def __call__(self, values: Sequence[float]) -> Union[float, complex]:
     """Aggregate multiple values into a single value."""
 
 
 class MultiObjective(BaseReward):
-  """Multi-objective reward."""
+  """Multi-objective reward.
 
-  class HParams(BaseReward.HParams):
-    """Hyperparameters for SingleObjective.
+  Attributes:
+    metrics: The keys of metric whose value will be used as reward.
+    aggregator_tpl: Multi-objective aggregator for coupling multiple values into
+      a single float value.
+    goal: Defines how the metric should be optimized. Acceptable values are
+      'maximize' or 'minimize'.
+    reward_for_nan: An optional float used as the reward when metric value is
+      NaN. If not specified, the reward will remain NaN so the trial will be
+      skipped by the search algorithm.
+  """
+  metrics: Optional[Sequence[Metric]] = None
+  aggregator_tpl: Optional[pax_fiddle.Config[MultiObjectiveAggregator]] = None
+  goal: str = 'maximize'
+  reward_for_nan: Optional[float] = None
+  _aggregator: Any = dataclasses.field(init=False, repr=False)
 
-    Attributes:
-      metrics: The keys of metric whose value will be used as reward.
-      aggregator_tpl: Multi-objective aggregator for coupling multiple values
-        into a single float value.
-      goal: Defines how the metric should be optimized. Acceptable values are
-        'maximize' or 'minimize'.
-      reward_for_nan: An optional float used as the reward when metric value is
-        NaN. If not specified, the reward will remain NaN so the trial will be
-        skipped by the search algorithm.
-    """
-    metrics: Optional[Sequence[Metric]] = None
-    aggregator_tpl: Optional[MultiObjectiveAggregator.HParams] = None
-    goal: str = 'maximize'
-    reward_for_nan: Optional[float] = None
+  def __post_init__(self):
+    if not self.metrics:
+      raise ValueError('Param `metrics` must be provided.')
 
-    def __post_init__(self):
-      super().__post_init__()
-      if not self.metrics:
-        raise ValueError('Param `metrics` must be provided.')
-
-      if len(self.metrics) > 1 and self.aggregator_tpl is None:
-        raise ValueError('Param `aggregator` must be provided.')
-
-  def __init__(self, hparams: HParams):
-    super().__init__(hparams)
-    if self._hparams.aggregator_tpl is not None:
-      self._aggregator = self._hparams.aggregator_tpl.Instantiate()
+    if len(self.metrics) > 1 and self.aggregator_tpl is None:
+      raise ValueError('Param `aggregator` must be provided.')
+    super().__post_init__()
+    if self.aggregator_tpl is not None:
+      self._aggregator = self.aggregator_tpl.Instantiate()
 
   def __call__(self, metrics_dict: Dict[str, float], global_step: int) -> float:
     del global_step
-    metric_values = [m.get_value(metrics_dict) for m in self._hparams.metrics]
-    if (self._hparams.reward_for_nan is not None
-        and any(math.isnan(m) for m in metric_values)):
-      return self._hparams.reward_for_nan
+    metric_values = [m.get_value(metrics_dict) for m in self.metrics]
+    if self.reward_for_nan is not None and any(
+        math.isnan(m) for m in metric_values
+    ):
+      return self.reward_for_nan
     if len(metric_values) == 1:
       reward = metric_values[0]
     else:
       assert self._aggregator is not None
       reward = self._aggregator(metric_values)
-    if self._hparams.goal == 'minimize':
+    if self.goal == 'minimize':
       reward *= -1
     return reward
 
   @property
   def used_metrics(self) -> Sequence[Metric]:
-    assert self._hparams.metrics is not None
-    return self._hparams.metrics
+    assert self.metrics is not None
+    return self.metrics
 
 
 class WeightedSumAggregator(MultiObjectiveAggregator):
-  """Weighted sum multiple objectives."""
+  """Weighted sum multiple objectives.
 
-  class HParams(MultiObjectiveAggregator.HParams):
-    """Hyperparameters for WeightedSumAggregator.
+  Attributes:
+    weights: A sequence of float as the weights for the objectives to optimize.
+      Its value does not need to sum to 1.
+  """
 
-    Attributes:
-      weights: A sequence of float as the weights for the objectives to
-        optimize. Its value does not need to sum to 1.
-    """
+  weights: Optional[Sequence[float]] = None
+  _sum_of_weights: Any = dataclasses.field(init=False, repr=False)
 
-    weights: Optional[Sequence[float]] = None
-
-  def __init__(self, hparams: HParams):
-    super().__init__(hparams)
-    weights = self._hparams.weights
+  def __post_init__(self):
+    super().__post_init__()
+    weights = self.weights
+    weights = typing.cast(Sequence[float], weights)
     if not weights or sum([abs(w) for w in weights]) == 0:
       raise ValueError(f'Invalid value for `weights`: {weights}')
     self._sum_of_weights = sum([abs(w) for w in weights]) * 1.0
 
-  def __call__(self, values: Sequence[float]) -> float:
+  def __call__(self, values: Sequence[float]) -> Union[float, complex]:
     """Aggregate multiple values into a single value."""
-    if len(values) != len(self._hparams.weights):
+    if len(values) != len(self.weights):
       raise ValueError(
-          f'The length of weights ({self._hparams.weights}) does not match '
-          f'the length of objective values {values!r}.')
-    return sum([w * v for w, v in zip(
-        self._hparams.weights, values)]) / self._sum_of_weights
+          f'The length of weights ({self.weights}) does not match '
+          f'the length of objective values {values!r}.'
+      )
+    return (
+        sum([w * v for w, v in zip(self.weights, values)])
+        / self._sum_of_weights
+    )
 
 
 def weighted_sum_reward(
@@ -385,26 +379,23 @@ def weighted_sum_reward(
 
 
 class TwoObjectiveAggregator(MultiObjectiveAggregator):
-  """Base class for two-objective aggregator."""
+  """Base class for two-objective aggregator.
 
-  class HParams(MultiObjectiveAggregator.HParams):
-    """Hyperparameters for SingleObjective.
+  Attributes:
+    cost_objective: A float value as cost objective.
+    exponent: A float exponent controlling the trade-off between quality and
+      cost. The more negative this exponent is, the more heavily the reward will
+      penalize this model with cost larger than cost objective.
+  """
+  cost_objective: Optional[float] = None
+  exponent: float = -0.07
 
-    Attributes:
-      cost_objective: A float value as cost objective.
-      exponent: A float exponent controlling the trade-off between quality and
-        cost. The more negative this exponent is, the more heavily the reward
-        will penalize this model with cost larger than cost objective.
-    """
-    cost_objective: Optional[float] = None
-    exponent: float = -0.07
+  def __post_init__(self):
+    super().__post_init__()
+    if self.cost_objective is None:
+      raise ValueError('Param `cost_objective` must be provided.')
 
-    def __post_init__(self):
-      super().__post_init__()
-      if self.cost_objective is None:
-        raise ValueError('Param `cost_objective` must be provided.')
-
-  def __call__(self, values: Sequence[float]) -> float:
+  def __call__(self, values: Sequence[float]) -> Union[float, complex]:
     """Aggregate multiple values into a single value."""
     if len(values) != 2:
       raise ValueError('Only two objectives are supported. Encountered: %r' %
@@ -412,7 +403,7 @@ class TwoObjectiveAggregator(MultiObjectiveAggregator):
     return self.aggregate(*values)
 
   @abc.abstractmethod
-  def aggregate(self, quality: float, cost: float) -> float:
+  def aggregate(self, quality: float, cost: float) -> Union[float, complex]:
     """Aggregate quality and cost into a single value."""
 
 
@@ -427,10 +418,10 @@ class TunasAbsolute(TwoObjectiveAggregator):
   https://arxiv.org/abs/2008.06120
   """
 
-  def aggregate(self, quality: float, cost: float) -> float:
+  def aggregate(self, quality: float, cost: float) -> Union[float, complex]:
     """Aggregate quality and cost into a single value."""
-    cost_ratio = cost / self._hparams.cost_objective
-    cost_adjustment = self._hparams.exponent * abs(cost_ratio - 1)
+    cost_ratio = cost / self.cost_objective
+    cost_adjustment = self.exponent * abs(cost_ratio - 1)
     return quality + cost_adjustment
 
 
@@ -444,10 +435,10 @@ class MnasHard(TwoObjectiveAggregator):
   https://arxiv.org/pdf/1807.11626.pdf
   """
 
-  def aggregate(self, quality: float, cost: float) -> float:
+  def aggregate(self, quality: float, cost: float) -> Union[float, complex]:
     """Aggregate quality and cost into a single value."""
-    cost_ratio = cost / self._hparams.cost_objective
-    cost_adjustment = min(pow(cost_ratio, self._hparams.exponent), 1.)
+    cost_ratio = cost / self.cost_objective
+    cost_adjustment = min(pow(cost_ratio, self.exponent), 1.0)
     return quality * cost_adjustment
 
 
@@ -462,10 +453,10 @@ class MnasSoft(TwoObjectiveAggregator):
   https://arxiv.org/pdf/1807.11626.pdf
   """
 
-  def aggregate(self, quality: float, cost: float) -> float:
+  def aggregate(self, quality: float, cost: float) -> Union[float, complex]:
     """Aggregate quality and cost into a single value."""
-    cost_ratio = cost / self._hparams.cost_objective
-    cost_adjustment = pow(cost_ratio, self._hparams.exponent)
+    cost_ratio = cost / self.cost_objective
+    cost_adjustment = pow(cost_ratio, self.exponent)
     return quality * cost_adjustment
 
 
@@ -511,16 +502,13 @@ class LastReportedMetricValues(MultiSubExperimentCrossStepMetricAggregator):
 
 
 class AverageMetricValues(MultiSubExperimentCrossStepMetricAggregator):
-  """Returns the average values of per-step metrics."""
+  """Returns the average values of per-step metrics.
 
-  class HParams(MultiSubExperimentCrossStepMetricAggregator.HParams):
-    """Hyperparameters for AverageMetricValues.
-
-    Attributes:
-      last_n: If not None, then only the `last_n` values will be used in the
-              metric average. If None, all values are used.
-    """
-    last_n: Optional[int] = None
+  Attributes:
+    last_n: If not None, then only the `last_n` values will be used in the
+      metric average. If None, all values are used.
+  """
+  last_n: Optional[int] = None
 
   def call(
       self, merged_metrics_across_steps: Sequence[Tuple[int, Dict[str, float]]]
@@ -533,31 +521,27 @@ class AverageMetricValues(MultiSubExperimentCrossStepMetricAggregator):
 
     metrics = {}
     for k, v in accumulated_metrics.items():
-      if self._hparams.last_n is not None:
-        metrics[k] = sum(v[-self._hparams.last_n:]) / len(
-            v[-self._hparams.last_n:])
+      if self.last_n is not None:
+        metrics[k] = sum(v[-self.last_n :]) / len(v[-self.last_n :])
       else:
         metrics[k] = sum(v) / len(v)
     return metrics
 
 
 class MetricsWithMaxValue(MultiSubExperimentCrossStepMetricAggregator):
-  """Returns the step metrics which has the max value on a metric."""
+  """Returns the step metrics which has the max value on a metric.
 
-  class HParams(MultiSubExperimentCrossStepMetricAggregator.HParams):
-    """Hyperparameters for ValueWithMax.
-
-    Attributes:
-      metric: An optional metric against whom to choose the max value.
-        If None, the comparison is against the reward.
-    """
-    metric: Optional[Metric] = None
+  Attributes:
+    metric: An optional metric against whom to choose the max value. If None,
+      the comparison is against the reward.
+  """
+  metric: Optional[Metric] = None
 
   def call(
       self, merged_metrics_across_steps: Sequence[Tuple[int, Dict[str, float]]]
       ) -> Dict[str, float]:
     """Returns an aggregated metric dict from metrics from multiple steps."""
-    metric = self._hparams.metric or Metric('reward')
+    metric = self.metric or Metric('reward')
     max_i, max_value = None, None
     # TODO(daiyip): current code assumes that all metrics are reported at
     # the same step, which might not be the case if we allow multiple processes
@@ -571,22 +555,19 @@ class MetricsWithMaxValue(MultiSubExperimentCrossStepMetricAggregator):
 
 
 class MetricsWithMinValue(MultiSubExperimentCrossStepMetricAggregator):
-  """Returns the step metrics which has the min value on an metric."""
+  """Returns the step metrics which has the min value on an metric.
 
-  class HParams(MultiSubExperimentCrossStepMetricAggregator.HParams):
-    """Hyperparameters for ValueWithMax.
-
-    Attributes:
-      metric: An optional metric against whom to choose the max value.
-        If None, the comparison is against the reward.
-    """
-    metric: Optional[Metric] = None
+  Attributes:
+    metric: An optional metric against whom to choose the max value. If None,
+      the comparison is against the reward.
+  """
+  metric: Optional[Metric] = None
 
   def call(
       self, merged_metrics_across_steps: Sequence[Tuple[int, Dict[str, float]]]
       ) -> Dict[str, float]:
     """Returns an aggregated metric dict from metrics from multiple steps."""
-    metric = self._hparams.metric or Metric('reward')
+    metric = self.metric or Metric('reward')
     min_i, min_value = None, None
     for i, (_, step_metrics) in enumerate(merged_metrics_across_steps):
       v = metric.get_value(step_metrics)
@@ -600,61 +581,57 @@ class MetricsWithMinValue(MultiSubExperimentCrossStepMetricAggregator):
 
 
 class EarlyStoppingByValue(BaseEarlyStoppingPolicy):
-  """Early stopping based on the absolute value of a metric at a step."""
+  """Early stopping based on the absolute value of a metric at a step.
 
-  class HParams(BaseEarlyStoppingPolicy.HParams):
-    """Hyperparameters for value-based early stopping policy.
-
-    Attributes:
-      step_values: A list of tuples for defining gating rules:
-        (step, threshold value).
-      metric: Metric to watch. If None, it watches the reward at the step.
-      maximize: If True, value below the threshold will be stopped. Otherwise
-        values above the threshold.
-    """
-    step_values: Optional[List[Tuple[int, float]]] = None
-    metric: Optional[Metric] = None
-    maximize: bool = True
+  Attributes:
+    step_values: A list of tuples for defining gating rules: (step, threshold
+      value).
+    metric: Metric to watch. If None, it watches the reward at the step.
+    maximize: If True, value below the threshold will be stopped. Otherwise
+      values above the threshold.
+  """
+  step_values: Optional[List[Tuple[int, float]]] = None
+  metric: Optional[Metric] = None
+  maximize: bool = True
 
   def __call__(self) -> pg.early_stopping.StepWise:
     def metric_to_watch(m: pg.tuning.Measurement) -> float:
-      metric = self._hparams.metric
+      metric = self.metric
       if metric is None:
         return m.reward
       return metric.get_value(m.metrics)
     return pg.early_stopping.early_stop_by_value(
-        step_values=self._hparams.step_values,
+        step_values=self.step_values,
         metric=metric_to_watch,
-        maximize=self._hparams.maximize)()
+        maximize=self.maximize,
+    )()
 
 
 class EarlyStoppingByRank(BaseEarlyStoppingPolicy):
-  """Early stopping based on the rank of a metric at a step."""
+  """Early stopping based on the rank of a metric at a step.
 
-  class HParams(BaseEarlyStoppingPolicy.HParams):
-    """Hyperparameters for rank-based early stopping policy.
-
-    Attributes:
-      step_ranks: A list of tuples for defining gating rules:
-        (step, threshold rank or threshold percentage, min_histogram_size).
-      metric: Metric to watch. If None, it watches the reward at the step.
-      maximize: If True, the sorting for computing the rank is from the largest
-        to the smallest, otherwise will be the smallest to the largest.
-    """
-    step_ranks: Optional[List[Tuple[int, Union[int, float], int]]] = None
-    metric: Optional[Metric] = None
-    maximize: bool = True
+  Attributes:
+    step_ranks: A list of tuples for defining gating rules: (step, threshold
+      rank or threshold percentage, min_histogram_size).
+    metric: Metric to watch. If None, it watches the reward at the step.
+    maximize: If True, the sorting for computing the rank is from the largest to
+      the smallest, otherwise will be the smallest to the largest.
+  """
+  step_ranks: Optional[List[Tuple[int, Union[int, float], int]]] = None
+  metric: Optional[Metric] = None
+  maximize: bool = True
 
   def __call__(self) -> pg.early_stopping.StepWise:
     def metric_to_watch(m: pg.tuning.Measurement) -> float:
-      metric = self._hparams.metric
+      metric = self.metric
       if metric is None:
         return m.reward
       return metric.get_value(m.metrics)
     return pg.early_stopping.early_stop_by_rank(
-        step_ranks=self._hparams.step_ranks,
+        step_ranks=self.step_ranks,
         metric=metric_to_watch,
-        maximize=self._hparams.maximize)()
+        maximize=self.maximize,
+    )()
 
 
 #
@@ -810,7 +787,8 @@ def parameter_sweep(
         del self
         return SearchHParams(
             search_algorithm=Sweeping.HParams(),
-            search_reward=search_reward)
+            search_reward=search_reward,
+            treats_early_stopped_trials_as_done=True)
 
     new_cls = _ParameterSweeping
     # Create a COMBINATION property and use it to set HP attributes' values.
@@ -836,4 +814,3 @@ def parameter_sweep(
     return new_cls
 
   return decorator
-

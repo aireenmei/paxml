@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 Google LLC.
+# Copyright 2022 The Pax Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,9 +15,8 @@
 
 """Tests for seqio_input."""
 
-from typing import Any, Callable, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 from unittest import mock
-
 from absl.testing import absltest
 from absl.testing import parameterized
 import numpy as np
@@ -38,19 +37,24 @@ INDEX_WITHIN_SHARD_KEY = seqio_input.INDEX_WITHIN_SHARD_KEY
 def _register_task(
     task_name: str,
     ds: tf.data.Dataset,
-    output_feature_names: Sequence[str] = ('inputs', 'targets')
+    output_feature_names: Sequence[str] = ('inputs', 'targets'),
+    add_eos: bool = True,
 ) -> None:
   """Register a dummy task."""
+  if add_eos:
+    preprocessors = [seqio.preprocessors.append_eos_after_trim]
+  else:
+    preprocessors = []
   seqio.TaskRegistry.add(
       task_name,
       source=seqio.FunctionDataSource(
           dataset_fn=lambda split, shuffle_files, seed=0: ds,
           splits=['train', 'validation']),
-      preprocessors=[
-          seqio.preprocessors.append_eos_after_trim,
-      ],
+      preprocessors=preprocessors,
       output_features={
-          feat: seqio.Feature(seqio.test_utils.sentencepiece_vocab())
+          feat: seqio.Feature(
+              seqio.test_utils.sentencepiece_vocab(),
+              add_eos=add_eos)
           for feat in output_feature_names
       },
       metric_fns=[])
@@ -307,6 +311,95 @@ class InputTest(flax_test_utils.TestCase, seqio.test_utils.FakeTaskTest):
     for _ in range(5):
       inp.get_next()
 
+  # TODO(b/272314337): enable after the next TF OSS release.
+  def test_file_based_checkpointing(self):
+    it = tf.data.Dataset.range(1).as_numpy_iterator()
+    if not isinstance(it, tf.__internal__.tracking.Trackable):
+      # TODO(b/272314337): enable after the next TF OSS release.
+      self.skipTest('file-based iterator checkpointing is not supported')
+
+    ckpt_dir = self.create_tempdir(name='checkpointing_test').full_path
+    ckpt_path = ckpt_dir + '/checkpoint'
+
+    name = 'checkpointing_files'
+    x = [{
+        'targets': [7, 8, 5, 6, 9],
+    }, {
+        'targets': [18, 14]
+    }, {
+        'targets': [21, 22, 23]
+    }]
+    ds = seqio.test_utils.create_default_dataset(x, ['targets'])
+    _register_task(name, ds, output_feature_names=['targets'])
+
+    p = seqio_input.SeqIOInput.HParams()
+    p.mixture_name = name
+    p.split_name = 'train'
+    p.task_feature_lengths = {'targets': 6}
+    p.feature_converter = seqio_input.LanguageModelFeatures(pack=False)
+    p.batch_size = 1
+    inp = instantiate(p)
+    batch = inp.get_next()
+    self.assertArraysEqual(
+        batch.ids,
+        np.array([[0, 7, 8, 5, 6, 9]], dtype=np.int32))
+    batch = inp.get_next()
+    self.assertArraysEqual(
+        batch.ids,
+        np.array([[0, 18, 14, 1, 0, 0]], dtype=np.int32))
+    inp.save(ckpt_path)
+    batch = inp.get_next()
+    self.assertArraysEqual(
+        batch.ids,
+        np.array([[0, 21, 22, 23, 1, 0]], dtype=np.int32))
+    inp.restore(ckpt_path)
+    batch = inp.get_next()
+    self.assertArraysEqual(
+        batch.ids,
+        np.array([[0, 21, 22, 23, 1, 0]], dtype=np.int32))
+
+  def test_byte_array_based_checkpointing(self):
+    it = tf.data.Dataset.range(1).as_numpy_iterator()
+    if not hasattr(it, '_save'):
+      # TODO(b/272314337): enable after the next TF OSS release.
+      self.skipTest('byte-based iterator checkpointing is not supported')
+    name = 'checkpointing_bytes'
+    x = [{
+        'targets': [7, 8, 5, 6, 9],
+    }, {
+        'targets': [18, 14]
+    }, {
+        'targets': [21, 22, 23]
+    }]
+    ds = seqio.test_utils.create_default_dataset(x, ['targets'])
+    _register_task(name, ds, output_feature_names=['targets'])
+
+    p = seqio_input.SeqIOInput.HParams()
+    p.mixture_name = name
+    p.split_name = 'train'
+    p.task_feature_lengths = {'targets': 6}
+    p.feature_converter = seqio_input.LanguageModelFeatures(pack=False)
+    p.batch_size = 1
+    inp = instantiate(p)
+    batch = inp.get_next()
+    self.assertArraysEqual(
+        batch.ids,
+        np.array([[0, 7, 8, 5, 6, 9]], dtype=np.int32))
+    batch = inp.get_next()
+    self.assertArraysEqual(
+        batch.ids,
+        np.array([[0, 18, 14, 1, 0, 0]], dtype=np.int32))
+    state = inp.get_state()
+    batch = inp.get_next()
+    self.assertArraysEqual(
+        batch.ids,
+        np.array([[0, 21, 22, 23, 1, 0]], dtype=np.int32))
+    inp.set_state(state)
+    batch = inp.get_next()
+    self.assertArraysEqual(
+        batch.ids,
+        np.array([[0, 21, 22, 23, 1, 0]], dtype=np.int32))
+
   def test_input_targets_only_pack(self):
     name = 'target_only_pack'
     x = [{
@@ -559,7 +652,6 @@ class InputTest(flax_test_utils.TestCase, seqio.test_utils.FakeTaskTest):
     })
     dataset_fn = lambda split, shuffle_files, seed=None: ds
     _register_dummy_task(task_name, dataset_fn)
-    decoder_outputs = [('blahh', {'decoded_substr': 'whatever'})]
     p = seqio_input.SeqIOInput.HParams()
     p.mixture_name = task_name
     p.split_name = 'validation'
@@ -570,12 +662,20 @@ class InputTest(flax_test_utils.TestCase, seqio.test_utils.FakeTaskTest):
     p.eval_metrics_targets_length = 3
     p.reset_for_eval = True
     inp = instantiate(p)
-    vocab = inp.mixture_or_task.output_features['inputs'].vocabulary
+    vocab = inp.mixture_or_task_inst.output_features['inputs'].vocabulary
     vocab.decode = mock.Mock(return_value='blahhh')
+    enumerated_ds = seqio_input._enumerate_dataset(
+        ds, p.is_training, shard_info=None
+    )
+    enumerated_iter = enumerated_ds.as_numpy_iterator()
+    decoder_outputs = []
+    for _ in range(len(ds)):
+      ex = next(enumerated_iter)
+      enum_id = py_utils.get_enumeration_id(ex)
+      decoder_outputs.append((enum_id, {'decoded_substr': 'ex pred'}))
     m = inp.compute_metrics(decoder_outputs)
     self.assertLen(m, 1)
-    self.assertEqual(m[0]['accuracy'], ['ex target', 'whatever'])
-    vocab.decode.assert_called_once_with([7, 8, 1])
+    self.assertEqual(m[0]['accuracy'], ['ex target', 'ex pred'])
 
   def test_compute_metrics_eval_num_batches(self):
     task_name = 'compute_metrics_eval_num_batches'
@@ -586,7 +686,6 @@ class InputTest(flax_test_utils.TestCase, seqio.test_utils.FakeTaskTest):
     }).repeat(6)
     dataset_fn = lambda split, shuffle_files, seed=None: ds
     _register_dummy_task(task_name, dataset_fn)
-    decoder_outputs = [('blahh', {'decoded_substr': 'whatever'})]
     p = seqio_input.SeqIOInput.HParams()
     p.mixture_name = task_name
     p.split_name = 'validation'
@@ -596,16 +695,51 @@ class InputTest(flax_test_utils.TestCase, seqio.test_utils.FakeTaskTest):
     p.is_training = False
     p.eval_metrics_targets_length = 3
     p.reset_for_eval = False
-    p.use_enumeration = False
-    p.eval_loop_num_batches = 2
+    p.eval_loop_num_batches = 3
     inp = instantiate(p)
-    vocab = inp.mixture_or_task.output_features['inputs'].vocabulary
+    vocab = inp.mixture_or_task_inst.output_features['inputs'].vocabulary
     vocab.decode = mock.Mock(return_value='blahhh')
+    enumerated_ds = seqio_input._enumerate_dataset(
+        ds, p.is_training, shard_info=None
+    )
+    enumerated_iter = enumerated_ds.as_numpy_iterator()
+    decoder_outputs = []
+    for _ in range(len(ds)):
+      ex = next(enumerated_iter)
+      enum_id = py_utils.get_enumeration_id(ex)
+      decoder_outputs.append((enum_id, {'decoded_substr': 'ex pred'}))
     m = inp.compute_metrics(decoder_outputs)
     metric_output = m[0]['accuracy']
-    self.assertLen(metric_output, 4)
-    self.assertEqual(metric_output,
-                     ['ex target', 'ex target', 'whatever', 'whatever'])
+    self.assertLen(metric_output, 6)
+    self.assertEqual(
+        metric_output,
+        [
+            'ex target',
+            'ex target',
+            'ex target',
+            'ex pred',
+            'ex pred',
+            'ex pred',
+        ],
+    )
+
+  def _construct_scoring_task_enum_fields(
+      self,
+      p: seqio_input.SeqIOInput.HParams,
+      ds: tf.data.Dataset,
+      scores: Sequence[float],
+  ) -> Sequence[Tuple[Optional[str], NestedMap]]:
+    enumerated_ds = seqio_input._enumerate_dataset(
+        ds, p.is_training, shard_info=None
+    )
+    enumerated_iter = enumerated_ds.as_numpy_iterator()
+    eval_output = []
+    for i in range(len(list(ds))):
+      ex = next(enumerated_iter)
+      enum_id = py_utils.get_enumeration_id(ex)
+      ex.update({'scores': scores[i]})
+      eval_output.append((enum_id, ex))
+    return eval_output
 
   def test_compute_metrics_eval(self):
     task_name = 'compute_metrics_eval'
@@ -629,23 +763,43 @@ class InputTest(flax_test_utils.TestCase, seqio.test_utils.FakeTaskTest):
     p.is_training = False
     p.reset_for_eval = True
     inp = instantiate(p)
-    labels = np.array([[7, 8, 1, 3, 9, 0], [15, 16, 17, 1, 29, 1]],
-                      dtype=np.int32)
     scores = np.array([1.0, 2.5], dtype=np.float32)
-    eval_output = []
-    for label, score in zip(labels, scores):
-      eval_output.append((None, py_utils.NestedMap(labels=label, scores=score)))
+    eval_output = self._construct_scoring_task_enum_fields(p, ds, scores)
     m = inp.compute_metrics_eval(eval_output)
     self.assertLen(m, 1)
     self.assertEqual(m[0]['total_score'], 3.5)
 
-    # length is wrong: does not match feature converter.
-    labels2 = np.array([[7, 8, 1, 3, 9], [15, 16, 17, 1, 29]], dtype=np.int32)
-    eval_output = []
-    for label, score in zip(labels2, scores):
-      eval_output.append((None, py_utils.NestedMap(labels=label, scores=score)))
-    with self.assertRaisesRegex(ValueError, 'Example not found'):
-      inp.compute_metrics_eval(eval_output)
+  @parameterized.named_parameters(
+      ('log_preprocessed_targets', True),
+      ('skip_log_preprocessed_targets', False),
+  )
+  def test_mutate_outputs_to_write(self, log_preprocessed_targets):
+    task_name = 'compute_metrics_eval'
+    x = [{
+        'inputs': [7, 8],
+        'targets': [3, 9],
+    }]
+    ds = seqio.test_utils.create_default_dataset(x)
+    dataset_fn = lambda split, shuffle_files, seed=None: ds
+    _register_dummy_task(task_name, dataset_fn)
+    p = seqio_input.SeqIOInput.HParams()
+    p.mixture_name = task_name
+    p.split_name = 'validation'
+    p.task_feature_lengths = {'inputs': 2, 'targets': 2}
+    p.feature_converter = seqio_input.LanguageModelFeatures(
+        pack=False, weights_on_targets_only=True)
+    p.batch_size = 1
+    p.is_training = False
+    p.log_preprocessed_targets = log_preprocessed_targets
+    inp = instantiate(p)
+    scores = np.array([1.0, 2.5], dtype=np.float32)
+    eval_output = self._construct_scoring_task_enum_fields(p, ds, scores)
+    _ = inp.compute_metrics_eval(eval_output)
+    self.assertIn('seqio_postprocessed_targets', eval_output[0][1])
+    if log_preprocessed_targets:
+      self.assertIn('seqio_preprocessed_targets', eval_output[0][1])
+    else:
+      self.assertNotIn('seqio_preprocessed_targets', eval_output[0][1])
 
   def _setup_seqio_test_registry(self,
                                  num_examples=10,
@@ -660,16 +814,12 @@ class InputTest(flax_test_utils.TestCase, seqio.test_utils.FakeTaskTest):
 
     def dataset_fn(split, shuffle_files=None, seed=42):
       del split, shuffle_files, seed
-      return tf.data.Dataset.from_tensor_slices({
-          'inputs':
-              np.arange(
-                  num_examples * task_feature_lengths['inputs'],
-                  dtype=np.int32).reshape(num_examples, -1),
-          'targets':
-              np.arange(
-                  num_examples * task_feature_lengths['targets'],
-                  dtype=np.int32).reshape(num_examples, -1),
-      })
+      d = {}
+      for k in task_feature_lengths:
+        d[k] = np.arange(
+            num_examples * task_feature_lengths[k], dtype=np.int32
+        ).reshape(num_examples, -1)
+      return tf.data.Dataset.from_tensor_slices(d)
 
     def pred_metric(targets, predictions):
       del targets, predictions
@@ -718,6 +868,59 @@ class InputTest(flax_test_utils.TestCase, seqio.test_utils.FakeTaskTest):
         'pred_and_score_task',
         'score_task',
     ])
+
+  def test_get_eval_hparams_for_seqio_missing_split(self):
+    self._setup_seqio_test_registry()
+    mixture_name = 'test_mixture'
+    batch_size = 32
+    feature_lengths = {'inputs': 1024, 'targets': 256}
+    seed = 123
+    predict_hparams = seqio_input.get_eval_hparams_for_seqio(
+        mixture_name,
+        batch_size,
+        feature_lengths,
+        seed,
+        seqio_input.MetricType.PREDICT,
+        split_name='eval',
+        check_split_exists=True
+    )
+    # None of the tasks have 'eval' split so this should be empty.
+    self.assertListEqual([p.name for p in predict_hparams], [])
+
+  def test_get_eval_hparams_for_seqio_scoring_keeps_lengths(self):
+    feature_lengths = {'inputs': 1024, 'targets': 3, 'weights': 3}
+    self._setup_seqio_test_registry(task_feature_lengths=feature_lengths)
+    mixture_name = 'test_mixture'
+    batch_size = 32
+    seed = 123
+    score_hparams = seqio_input.get_eval_hparams_for_seqio(
+        mixture_name,
+        batch_size,
+        feature_lengths,
+        seed,
+        seqio_input.MetricType.SCORE,
+        eval_metrics_retain_task_features=True,
+        feature_converter=seqio.PassThroughFeatureConverter(),
+    )
+    inp: seqio_input.SeqIOInput = instantiate(score_hparams[0])
+    self.assertSameElements(inp._hparams.task_feature_lengths.keys(),
+                            ['inputs', 'targets', 'weights'])
+
+    score_hparams = seqio_input.get_eval_hparams_for_seqio(
+        mixture_name,
+        batch_size,
+        feature_lengths,
+        seed,
+        seqio_input.MetricType.SCORE,
+        eval_metrics_retain_task_features=False,
+        feature_converter=seqio.PassThroughFeatureConverter(),
+    )
+    inp: seqio_input.SeqIOInput = instantiate(score_hparams[0])
+    inp.get_next()
+    self.assertSameElements(
+        inp._hparams.task_feature_lengths.keys(),
+        ['inputs', 'targets'],
+    )
 
   def test_repeat_on_full_eval_fails(self):
     self._setup_seqio_test_registry()
@@ -811,24 +1014,35 @@ class InputTest(flax_test_utils.TestCase, seqio.test_utils.FakeTaskTest):
     # fails when model.process_decode_out doesn't filter out padded eval samples
     common_kv = {SHARD_INDEX_KEY: 0, NUM_SHARDS_KEY: 1}
     process_decode_output = [
-        ('prefix-key-0', NestedMap.FromNestedDict({
-            'eval_sample_weights': 1, INDEX_WITHIN_SHARD_KEY: 0, **common_kv})),
-        ('prefix-key-1', NestedMap.FromNestedDict({
-            'eval_sample_weights': 1, INDEX_WITHIN_SHARD_KEY: 1, **common_kv})),
-        ('prefix-key-2', NestedMap.FromNestedDict(
-            {'eval_sample_weights': 0, INDEX_WITHIN_SHARD_KEY: 2, **common_kv}))
-        ]
+        (
+            'prefix-key-0',
+            NestedMap.FromNestedDict({INDEX_WITHIN_SHARD_KEY: 0, **common_kv}),
+        ),
+        (
+            'prefix-key-1',
+            NestedMap.FromNestedDict({INDEX_WITHIN_SHARD_KEY: 1, **common_kv}),
+        ),
+        (
+            'prefix-key-2',
+            NestedMap.FromNestedDict({
+                SHARD_INDEX_KEY: -1,
+                NUM_SHARDS_KEY: -1,
+                INDEX_WITHIN_SHARD_KEY: -1,
+            }),
+        ),
+    ]
     decode_out = NestedMap.FromNestedDict({
-        'eval_sample_weights': np.array([1, 1, 0], dtype=np.float32),
-        SHARD_INDEX_KEY: np.zeros(3, dtype=np.float32),
-        NUM_SHARDS_KEY: np.ones(3, dtype=np.float32),
-        INDEX_WITHIN_SHARD_KEY: np.arange(3, dtype=np.float32)})
+        SHARD_INDEX_KEY: np.array([0, 0, -1]),
+        NUM_SHARDS_KEY: np.array([1, 1, -1]),
+        INDEX_WITHIN_SHARD_KEY: np.array([0, 1, -1]),
+    })
 
     with self.assertRaisesRegex(
-        RuntimeError,
-        'The length of enum keys != num kv-pairs returned by .*'):
-      _ = seqio_input.maybe_update_decode_output_keys(process_decode_output,
-                                                      decode_out)
+        RuntimeError, 'The length of enum keys != num kv-pairs returned by .*'
+    ):
+      _ = seqio_input.maybe_update_decode_output_keys(
+          process_decode_output, decode_out
+      )
 
   def test_update_decode_output_keys(self):
     common_kv = {
@@ -871,6 +1085,96 @@ class InputTest(flax_test_utils.TestCase, seqio.test_utils.FakeTaskTest):
         '.*must set LanguageModelFeatures.weights_on_targets_only=True'):
       _ = instantiate(p)
 
+  def test_ininputs_target_suffix_lm(self):
+    name = 'test_weights'
+    x = [{
+        'inputs': [2, 8, 9, 3],
+        'targets': [2, 4],
+        'suffixes': [3, 1],
+    }, {
+        'inputs': [3, 4, 6, 4],
+        'targets': [4, 8, 7],
+        'suffixes': []
+    }]
+    ds = seqio.test_utils.create_default_dataset(
+        x, feature_names=('inputs', 'targets', 'suffixes'))
+    _register_task(name, ds, add_eos=False)
+    expected_labels = np.array(
+        [[2, 8, 9, 3, 2, 4, 3, 1, 3, 4, 6, 4, 4, 8, 7, 0, 0]],
+        dtype=np.int32)
+    expected_ids = np.array(
+        [[0, 2, 8, 9, 3, 2, 4, 3, 0, 3, 4, 6, 4, 4, 8, 0, 0]],
+        dtype=np.int32)
+    expected_paddings = np.array(
+        [[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1]],
+        dtype=np.float32)
+    expected_weights = np.array(
+        [[0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 1, 0, 0]],
+        dtype=np.float32)
+    expected_inputs_indicator = np.array(
+        [[1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0]],
+        dtype=np.int32)
+
+    p = seqio_input.SeqIOInput.HParams()
+    p.mixture_name = name
+    p.split_name = 'validation'
+    p.task_feature_lengths = {'inputs': 10, 'targets': 4, 'suffixes': 3}
+    p.feature_converter = seqio_input.LanguageModelFeatures(
+        pack=True, weights_on_targets_only=True, target_has_suffix=True)
+    p.batch_size = 1
+    p.is_training = False
+    inp = instantiate(p)
+    batch = inp.get_next()
+    self.assertArraysEqual(batch.ids, expected_ids)
+    self.assertArraysEqual(batch.labels, expected_labels)
+    self.assertArraysEqual(batch.paddings, expected_paddings)
+    self.assertArraysEqual(batch.weights, expected_weights)
+    self.assertArraysEqual(batch.inputs_indicator, expected_inputs_indicator)
+
+    name = 'test_weights_2'
+    x = [{
+        'inputs': [2, 8, 9, 3],
+        'targets': [2, 4],
+        'suffixes': [3, 1],
+    }, {
+        'inputs': [3, 4, 6, 4],
+        'targets': [],
+        'suffixes': [4, 8, 7]
+    }]
+    ds = seqio.test_utils.create_default_dataset(
+        x, feature_names=('inputs', 'targets', 'suffixes'))
+    _register_task(name, ds, add_eos=False)
+    expected_labels = np.array(
+        [[2, 8, 9, 3, 2, 4, 3, 1, 3, 4, 6, 4, 4, 8, 7, 0, 0]],
+        dtype=np.int32)
+    expected_ids = np.array(
+        [[0, 2, 8, 9, 3, 2, 4, 3, 0, 3, 4, 6, 4, 4, 8, 0, 0]],
+        dtype=np.int32)
+    expected_paddings = np.array(
+        [[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1]],
+        dtype=np.float32)
+    expected_weights = np.array(
+        [[0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 1, 0, 0]],
+        dtype=np.float32)
+    expected_inputs_indicator = np.array(
+        [[1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0]],
+        dtype=np.int32)
+
+    p = seqio_input.SeqIOInput.HParams()
+    p.mixture_name = name
+    p.split_name = 'validation'
+    p.task_feature_lengths = {'inputs': 10, 'targets': 4, 'suffixes': 3}
+    p.feature_converter = seqio_input.LanguageModelFeatures(
+        pack=True, weights_on_targets_only=True, target_has_suffix=True)
+    p.batch_size = 1
+    p.is_training = False
+    inp = instantiate(p)
+    batch = inp.get_next()
+    self.assertArraysEqual(batch.ids, expected_ids)
+    self.assertArraysEqual(batch.labels, expected_labels)
+    self.assertArraysEqual(batch.paddings, expected_paddings)
+    self.assertArraysEqual(batch.weights, expected_weights)
+    self.assertArraysEqual(batch.inputs_indicator, expected_inputs_indicator)
 
 if __name__ == '__main__':
   absltest.main()

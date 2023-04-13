@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 Google LLC.
+# Copyright 2022 The Pax Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -410,12 +410,15 @@ class RewardsTest(absltest.TestCase):
 
     with self.assertRaisesRegex(ValueError,
                                 'Param `metric` should not be None'):
-      _ = automl.SingleObjective.HParams()
+      _ = instantiate(automl.SingleObjective.HParams())
 
     with self.assertRaisesRegex(ValueError,
                                 'Param `goal` should be either .*'):
-      _ = automl.SingleObjective.HParams(
-          metric=automl.Metric.eval('accuracy'), goal='abc')
+      _ = instantiate(
+          automl.SingleObjective.HParams(
+              metric=automl.Metric.eval('accuracy'), goal='abc'
+          )
+      )
 
     with self.assertRaisesRegex(KeyError,
                                 'Metric .* does not match with any metrics'):
@@ -458,14 +461,18 @@ class RewardsTest(absltest.TestCase):
 
     with self.assertRaisesRegex(ValueError,
                                 'Param `metrics` must be provided.'):
-      _ = automl.MultiObjective.HParams()
+      _ = instantiate(automl.MultiObjective.HParams())
 
     with self.assertRaisesRegex(ValueError,
                                 'Param `aggregator` must be provided.'):
-      _ = automl.MultiObjective.HParams(metrics=[
-          automl.Metric.eval('accuracy'),
-          automl.Metric.train_steps_per_second()
-      ])
+      _ = instantiate(
+          automl.MultiObjective.HParams(
+              metrics=[
+                  automl.Metric.eval('accuracy'),
+                  automl.Metric.train_steps_per_second(),
+              ]
+          )
+      )
 
     with self.assertRaisesRegex(KeyError,
                                 'Metric .* does not match with any metrics'):
@@ -514,7 +521,7 @@ class MultiObjectiveAggregatorTest(absltest.TestCase):
 
     with self.assertRaisesRegex(ValueError,
                                 'Param `cost_objective` must be provided.'):
-      _ = automl.TunasAbsolute.HParams()
+      _ = instantiate(automl.TunasAbsolute.HParams())
 
   def test_mnas_hard(self):
     aggregator = instantiate(automl.MnasHard.HParams(cost_objective=1))
@@ -706,11 +713,9 @@ class EarlyStoppingErrorTest(absltest.TestCase):
 
 class MyTask(base_task.BaseTask):
   """Task for testing purpose."""
-
-  class HParams(base_task.BaseTask.HParams):
-    learning_rate: Optional[float] = None
-    batch_size: Optional[int] = None
-    program_str: Optional[str] = None
+  learning_rate: Optional[float] = None
+  batch_size: Optional[int] = None
+  program_str: Optional[str] = None
 
 
 class RegularExperiment(base_experiment.BaseExperiment):

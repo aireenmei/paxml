@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 Google LLC.
+# Copyright 2022 The Pax Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -51,8 +51,8 @@ function main() {
 
   echo "=== Copy paxml files"
 
-  cp ${PIP_FILE_PREFIX}setup.py "${TMPDIR}"
-  cp ${PIP_FILE_PREFIX}requirements.in "${TMPDIR}"
+  cp setup.py "${TMPDIR}"
+  cp requirements.in "${TMPDIR}"
   cp LICENSE "${TMPDIR}"
   rsync -avm -L paxml "${TMPDIR}"
   rsync -avm -L  --include="*.so" --include="*_pb2.py" \

@@ -54,14 +54,13 @@ RUN mkdir /bazel && \
 
 COPY . /paxml
 RUN mkdir $WHEEL_FOLDER
-RUN git clone -b r${praxis_version} https://github.com/google/praxis.git
+RUN if [ "$praxis_version" = "release-test" ] ; then git clone https://github.com/google/praxis.git; else git clone -b r${praxis_version} https://github.com/google/praxis.git; fi
+RUN if [ "$praxis_version" = "release-test" ] ; then sed -i 's/ @ git.*//g' /praxis/requirements.in; fi
+RUN pip3 install -e praxis
 
 RUN cp -r praxis/praxis /paxml/
-
-RUN pip3 install -r paxml/paxml/pip_package/requirements.txt
-
-RUN git clone https://github.com/google/flaxformer.git
-RUN cd flaxformer && pip3 install .
+RUN sed -i 's/ @ git.*//g' paxml/requirements.in
+RUN pip3 install -r paxml/requirements.in
 
 RUN mv paxml/paxml/pip_package /paxml/
 RUN cd /paxml && bash pip_package/build.sh

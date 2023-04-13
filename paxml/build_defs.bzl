@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 Google LLC.
+# Copyright 2022 The Pax Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -71,8 +71,11 @@ def pax_targets(
         name = "",
         add_main_gpu_target = True,
         add_main_mpm_target = True,
+        main_kwargs = None,
+        add_smoke_test = True,
         smoke_test_exclude_regexes = "",
         smoke_test_include_only_regexes = "",
+        smoke_test_py_test_rule = py_strict_test,
         smoke_test_args = None,
         smoke_test_kwargs = None,
         main_src = "//paxml:main.py"):
@@ -101,6 +104,8 @@ def pax_targets(
       name: unused.
       add_main_gpu_target: Build with jax GPU dependency.
       add_main_mpm_target: Add a ':main_mpm' target.
+      main_kwargs: dict of args to provide when building main binary.
+      add_smoke_test: Whether to add the :all_experiments_smoke_test target.
       smoke_test_args: The list of command line arguments that can be passed to the
        :all_experiments_smoke_test target.
       smoke_test_exclude_regexes: Exclusion regexes of experiment configurations to be
@@ -125,6 +130,8 @@ def pax_targets(
     )
     extra_deps = experiments + (extra_deps or [])
 
+    if not main_kwargs:
+        main_kwargs = {}
     main_name = "main"
     main_name = main_name if not prefix_name else "%s_%s" % (prefix_name, main_name)
     export_binary(
@@ -137,6 +144,7 @@ def pax_targets(
         ] + extra_deps,
         exp_sources = exp_sources,
         # Implicit py_binary flag
+        **main_kwargs
     )
     if add_main_mpm_target and hasattr(native, "genmpm"):
         main_name = "main_mpm"
@@ -169,31 +177,41 @@ def pax_targets(
             exec_properties = {"mem": "24g"},
         )
 
-    test_name = "all_experiments_smoke_test"
-    test_name = test_name if not prefix_name else "%s_%s" % (prefix_name, test_name)
+        # Add a test to check that the experiments are importable in a GPU build.
+        # This prevents libraries that are incompatible with GPU (e.g. those that
+        # runs TensorFlow ops during import).
+        test_name = "gpu_import_test"
+        test_name = test_name if not prefix_name else "%s_%s" % (prefix_name, test_name)
 
-    smoke_test_args = smoke_test_args or []
-    if smoke_test_exclude_regexes:
-        smoke_test_args.append("--exclude_regexes=" + _shell_quote(smoke_test_exclude_regexes))
-    if smoke_test_include_only_regexes:
-        smoke_test_args.append("--include_only_regexes=" + _shell_quote(smoke_test_include_only_regexes))
+        # Google-internal tests.
 
-    smoke_test_kwargs = smoke_test_kwargs or {}
-    _export_test(
-        name = test_name,
-        test_src = "//paxml:experiment_imports_all_test.py",
-        exp_sources = exp_sources,
-        deps = [
-            # Implicit absl.app dependency.
-            # Implicit absl.flags dependency.
-            # Implicit absl.testing.absltest.absltest dependency.
-            "//paxml:experiment_imports_test_helper",
-            "//paxml:experiment_registry",
-        ] + extra_deps,
-        timeout = "long",
-        args = smoke_test_args,
-        **smoke_test_kwargs
-    )
+    if add_smoke_test:
+        test_name = "all_experiments_smoke_test"
+        test_name = test_name if not prefix_name else "%s_%s" % (prefix_name, test_name)
+
+        smoke_test_args = smoke_test_args or []
+        if smoke_test_exclude_regexes:
+            smoke_test_args.append("--exclude_regexes=" + _shell_quote(smoke_test_exclude_regexes))
+        if smoke_test_include_only_regexes:
+            smoke_test_args.append("--include_only_regexes=" + _shell_quote(smoke_test_include_only_regexes))
+
+        smoke_test_kwargs = smoke_test_kwargs or {}
+        _export_test(
+            name = test_name,
+            test_src = "//paxml:experiment_imports_all_test.py",
+            exp_sources = exp_sources,
+            deps = [
+                # Implicit absl.app dependency.
+                # Implicit absl.flags dependency.
+                # Implicit absl.testing.absltest.absltest dependency.
+                "//paxml:experiment_imports_test_helper",
+                "//paxml:experiment_registry",
+            ] + extra_deps,
+            timeout = "long",
+            py_test_rule = smoke_test_py_test_rule,
+            args = smoke_test_args,
+            **smoke_test_kwargs
+        )
 
     dump_hparams_name = "dump_hparams"
     dump_hparams_name = dump_hparams_name if not prefix_name else "%s_%s" % (
@@ -215,6 +233,7 @@ def pax_targets(
             "//praxis:base_hyperparams",
             "//praxis:base_layer",
             "//praxis:py_utils",
+            # Implicit pyglove dependency.
             # Implicit tensorflow_no_contrib dependency.
         ] + extra_deps,
         exp_sources = exp_sources,
@@ -239,11 +258,35 @@ def pax_targets(
         exp_sources = exp_sources,
     )
 
+    model_analysis_name = "model_analysis"
+    model_analysis_name = model_analysis_name if not prefix_name else "%s_%s" % (
+        prefix_name,
+        model_analysis_name,
+    )
+    export_binary(
+        name = model_analysis_name,
+        main = "//paxml/tools:model_analysis.py",
+        py_binary_rule = pytype_strict_binary,
+        deps = [
+            # Implicit absl.app dependency.
+            # Implicit absl.flags dependency.
+            # Implicit jax dependency.
+            # Implicit numpy dependency.
+            "//paxml:experiment_registry",
+            "//paxml:tasks_lib",
+            "//paxml:trainer_lib",
+            "//praxis:base_layer",
+            "//praxis:py_utils",
+        ] + extra_deps,
+        exp_sources = exp_sources,
+    )
+
 def _export_test(
         name,
         test_src,
         deps,
         exp_sources,
+        py_test_rule,
         args,
         **kwargs):
     """Define a `py_test()` at the current package.
@@ -259,7 +302,7 @@ def _export_test(
     test_copied = "%s.py" % name
     _copy_src(output_name = test_copied, source_target = test_src, exp_sources = exp_sources)
 
-    py_strict_test(
+    py_test_rule(
         name = name,
         python_version = "PY3",
         srcs_version = "PY3",

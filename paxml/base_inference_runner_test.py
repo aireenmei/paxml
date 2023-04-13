@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 Google LLC.
+# Copyright 2022 The Pax Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -41,19 +41,13 @@ TrainState = train_states.TrainState
 
 
 class DummyInference(base_inference_runner.BaseInferenceRunner):
-
-  class HParams(base_inference_runner.BaseInferenceRunner.HParams):
-    output: Any = None
-    output_schema: Any = None
+  output: Any = None
+  output_schema: Any = None
 
   def infer(self, train_state: TrainState, prng_key: PRNGKey,
             var_weight_hparams: NestedWeightHParams,
             input_batch: NestedMap) -> NestedMap:
-    return self.hparams.output
-
-  @property
-  def output_schema(self) -> NestedMap:
-    return self.hparams.output_schema
+    return self.output
 
 
 class BaseInferenceRunnerTest(test_utils.TestCase):

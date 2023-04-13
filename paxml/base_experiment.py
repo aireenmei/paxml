@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 Google LLC.
+# Copyright 2022 The Pax Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,9 +20,11 @@ to a specific ML experiment.
 """
 
 import abc
-from typing import Dict, List, Type, TypeVar
+from typing import Dict, List, Optional, Type, TypeVar
 from paxml import automl
 from paxml import base_task
+from paxml import partitioning
+from paxml import programs
 from praxis import base_input
 
 _BaseExperimentT = TypeVar('_BaseExperimentT', bound='BaseExperiment')
@@ -114,6 +116,19 @@ class BaseExperiment(metaclass=abc.ABCMeta):
       A dict of sub-experiment ID to sub-experiment class.
     """
     return {'': self.__class__}
+
+  def partitioner(self) -> Optional[partitioning.Partitioner]:
+    """Returns the partitioner to use for partitioning model functions.
+
+    Returns:
+      A Partitioner instance or None, in which case a default partitioner will
+      be created based on the task settings.
+    """
+    return None
+
+  def train_program(self) -> programs.BaseTrainProgram:
+    """Returns the train program to use for training the model."""
+    return programs.SingleTaskTrainProgram()
 
   def __init_subclass__(cls):
     """Modifications to the subclasses."""

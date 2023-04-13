@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 Google LLC.
+# Copyright 2022 The Pax Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -174,7 +174,7 @@ class JnpEncoder(json.JSONEncoder):
   """jax.numpy compatible encoder: https://github.com/mpld3/mpld3/issues/434."""
 
   def default(self, o: Any) -> Any:
-    if isinstance(o, jax.numpy.DeviceArray):
+    if isinstance(o, jax.Array):
       return _to_ndarray(o)
     elif isinstance(o, np.integer):
       return int(o)
@@ -332,9 +332,11 @@ def checkpoint_progress(job_log_dir: epath.Path, checkpoint_step: Optional[int],
       fname.unlink()
 
 
-def get_checkpoint_step(job_log_dir: epath.Path,
-                        restore_checkpoint_dir: epath.Path,
-                        mode: EvaluationMode) -> Optional[int]:
+def get_checkpoint_step(
+    job_log_dir: epath.Path,
+    restore_checkpoint_dir: epath.Path,
+    mode: EvaluationMode,
+) -> Optional[int]:
   """Gets the latest checkpoint step to eval/decode on.
 
   Args:
@@ -361,5 +363,4 @@ def get_checkpoint_step(job_log_dir: epath.Path,
     logging.info('Resuming %s from step %d.', mode.value, step)
     return step
 
-  return checkpoints.retrieve_latest_checkpoint_step(
-      restore_checkpoint_dir)
+  return checkpoints.retrieve_latest_checkpoint_step(restore_checkpoint_dir)

@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 Google LLC.
+# Copyright 2022 The Pax Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@ set -e -x
 export PYTHON_VERSION="${PYTHON_VERSION:-3}"
 export PYTHON_MINOR_VERSION="${PYTHON_MINOR_VERSION}"
 export PIP_MANYLINUX2010="${PIP_MANYLINUX2010:-1}"
-export DST_DIR="${WHEEL_FOLDER:-/tmp/wheels}"
+export DEST="${WHEEL_FOLDER:-/tmp/wheels}"
 
 if [[ -z "${PYTHON_MINOR_VERSION}" ]]; then
   PYTHON="python${PYTHON_VERSION}"
@@ -76,5 +76,5 @@ bazel clean
 bazel build ...
 bazel test  --test_output=all --test_verbose_timeout_warnings   --  paxml/... -paxml/tasks/vision:input_generator_test
 
-./pip_package/build_pip_pkg.sh "$DST_DIR" ${PYTHON_VERSION}
-pip3 freeze > "${DST_DIR}/dependencies.txt"
+./pip_package/build_pip_pkg.sh "$DEST" ${PYTHON_VERSION}
+pip3 freeze > "${DEST}/dependencies.txt"
