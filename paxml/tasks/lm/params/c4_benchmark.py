@@ -64,6 +64,25 @@ class C4Spmd16BAdam32Replicas(c4.C4SpmdAdam):
   ICI_MESH_SHAPE = [1, 16, 2]
 
 @experiment_registry.register
+class C4Spmd16BAdam16Replicas(c4.C4SpmdAdam):
+  r"""GPT-3 config with 16B params. Model Parameters: 
+  Global batch size = 1 * 1 * 16 * 8 = 128"""
+  NUM_LAYERS = 36
+  MODEL_DIMS = 6144
+  HIDDEN_DIMS = MODEL_DIMS * 4
+  NUM_HEADS = 48
+  DIMS_PER_HEAD = 128
+  PERCORE_BATCH_SIZE = 8
+  MAX_SEQ_LEN = 1024
+  VOCAB_SIZE = 32000
+  FPROP_DTYPE = jnp.bfloat16
+  USE_REPEATED_LAYER = True
+
+  SUMMARY_INTERVAL_STEPS = 10
+  CHECKPOINT_POLICY = layers.AutodiffCheckpointType.SAVE_NOTHING
+  ICI_MESH_SHAPE = [1, 16, 1]
+
+@experiment_registry.register
 class C4Spmd32BAdam64Replicas(c4.C4SpmdAdam):
   r"""GPT-3 config with 32B params. Model Parameters: 
   Global batch size = 1 * 16 * 4 * 8 = 512"""
