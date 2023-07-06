@@ -905,7 +905,7 @@ class C4Spmd1BAdam4ReplicasLimitSteps(C4Spmd1BAdam4Replicas):
 
 
 @experiment_registry.register
-class C4Spmd2BAdam4Replicas(C4SpmdAdam):
+class C4Spmd2BAdam8Replicas(C4SpmdAdam):
   r"""GPT-3 config with 2B params.
 
   Model Parameters: Global batch size = 1 * 4 * 1 * 32 = 128.
@@ -921,9 +921,18 @@ class C4Spmd2BAdam4Replicas(C4SpmdAdam):
   FPROP_DTYPE = jnp.bfloat16
   USE_REPEATED_LAYER = True
 
+  PROFILER_NUM_STEPS = 5
+  PROFILER_MIN_DURATION_SEC = 5
+  PROFILER_CAPTURE_STEP = 15
+
   SUMMARY_INTERVAL_STEPS = 10
   CHECKPOINT_POLICY = layers.AutodiffCheckpointType.SAVE_NOTHING
-  ICI_MESH_SHAPE = [1, 4, 1]
+  ICI_MESH_SHAPE = [1, 4, 2]
+
+  def task(self) -> tasks_lib.SingleTask.HParams:
+    task_p = super().task()
+    task_p.train.num_train_steps = 30
+    return task_p  
 
 
 @experiment_registry.register
